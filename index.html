@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Panel Designer</title>
+    <style>
+        body { margin: 0; }
+        #scene-container { width: 100%; height: calc(100vh - 50px); }
+        #controls { position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.7); padding: 10px; width: 300px; }
+        .step { margin-bottom: 20px; }
+        .step h3 { margin-top: 0; }
+        .button-container { position: absolute; top: 10px; left: 350px; }
+        .column-section, .row-section { margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <!-- Step 1: Panel -->
+        <div class="step" id="step1-panel">
+            <h3>Step 1: Panel</h3>
+            <label>Total Width: <input type="number" id="width" value="500" min="100" max="10000" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Total Height: <input type="number" id="height" value="500" min="100" max="10000" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Thickness: <input type="number" id="thickness" value="18" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Panel Color: <input type="color" id="panelColor" value="#FF8C00"></label><br>
+            <label>Columns: <input type="number" id="columns" value="1" min="1" max="10" onchange="updateColumnInputs()" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Spacing (Vertical): <input type="number" id="spacing" value="4" min="0" max="100" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Spacing (Horizontal): <input type="number" id="spacingHorizontal" value="4" min="0" max="100" onkeypress="checkEnterKey(event)"></label><br>
+            <div id="column-sections"></div>
+        </div>
+
+        <!-- Step 2: Pattern -->
+        <div class="step" id="step2-pattern">
+            <h3>Step 2: Pattern</h3>
+            <label>Pattern: 
+                <select id="pattern" onchange="updatePanel()">
+                    <option value="horizontal">Horizontal</option>
+                    <option value="vertical">Vertical</option>
+                    <option value="cross">Cross</option>
+                </select>
+            </label><br>
+            <label>Min Spacing: <input type="number" id="minSpacing" value="10" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Max Spacing: <input type="number" id="maxSpacing" value="50" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Min Width: <input type="number" id="minWidth" value="5" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
+            <label>Max Width: <input type="number" id="maxWidth" value="15" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
+        </div>
+
+        <!-- Step 3: Export -->
+        <div class="step" id="step3-export">
+            <h3>Step 3: Export</h3>
+            <button onclick="previewPDF()">Preview PDF</button>
+            <button onclick="exportModel()">Export Model</button>
+            <button onclick="exportCNC()">Export CNC Code</button>
+            <button onclick="exportZip()">Export All in ZIP</button>
+        </div>
+    </div>
+
+    <div class="button-container">
+        <button onclick="updatePanel()">Update Panel</button>
+        <button onclick="resetView()">Default View</button>
+    </div>
+
+    <div id="scene-container"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/simplex-noise/2.4.0/simplex-noise.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.3.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.3.2/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
