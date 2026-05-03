@@ -49,10 +49,15 @@ function init() {
 function createPanel() {
     clearScene();
 
+    // Ensure dynamic column/row inputs exist for the current `columns` value
+    // before we read or write to them. Without this, pressing Enter on the
+    // columns field renders before onchange has regenerated the inputs.
+    updateColumnInputs();
+
     const width = parseFloat(document.getElementById('width').value);
     const height = parseFloat(document.getElementById('height').value);
     const thickness = parseFloat(document.getElementById('thickness').value);
-    const columns = parseFloat(document.getElementById('columns').value);
+    const columns = parseInt(document.getElementById('columns').value);
     const spacing = parseFloat(document.getElementById('spacing').value);
     const spacingHorizontal = parseFloat(document.getElementById('spacingHorizontal').value);
     const panelColor = new THREE.Color(document.getElementById('panelColor').value);
@@ -101,20 +106,23 @@ function createPanel() {
 
     let xOffset = -width / 2 + columnWidths[0] / 2;
     for (let i = 0; i < columns; i++) {
-        const rows = parseFloat(document.getElementById(`rows${i + 1}`).value);
+        const rowsEl = document.getElementById(`rows${i + 1}`);
+        const rows = rowsEl ? parseInt(rowsEl.value) : (adjustedValues[`rows${i + 1}`] || 1);
         let totalSpecifiedHeight = 0;
         const rowHeights = [];
         for (let j = 0; j < rows - 1; j++) {
             const rowHeight = adjustedValues[`rowHeight${i + 1}_${j + 1}`] || (height - (rows - 1) * spacingHorizontal) / rows;
             rowHeights.push(rowHeight);
             totalSpecifiedHeight += rowHeight;
-            document.getElementById(`rowHeight${i + 1}_${j + 1}`).value = rowHeight; // Set adjusted or default value
+            const rhEl = document.getElementById(`rowHeight${i + 1}_${j + 1}`);
+            if (rhEl) rhEl.value = rowHeight;
         }
         const lastRowHeight = height - totalSpecifiedHeight - (rows - 1) * spacingHorizontal;
         rowHeights.push(lastRowHeight);
-        if (document.getElementById(`rowHeight${i + 1}_${rows}`)) {
-            document.getElementById(`rowHeight${i + 1}_${rows}`).value = lastRowHeight; // Set value but not adjustable
-            document.getElementById(`rowHeight${i + 1}_${rows}`).disabled = true;
+        const lastRhEl = document.getElementById(`rowHeight${i + 1}_${rows}`);
+        if (lastRhEl) {
+            lastRhEl.value = lastRowHeight;
+            lastRhEl.disabled = true;
         }
 
         let yOffset = -height / 2 + rowHeights[0] / 2;
