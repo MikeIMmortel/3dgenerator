@@ -1,8 +1,11 @@
 let scene, camera, renderer, panel, ambientLight, directionalLight;
-let isOrganicEnabled = false;
 const simplex = new SimplexNoise();
 let carvingLines = [];
+let currentLinesData = [];
 let adjustedValues = {}; // To store adjusted values by the user
+
+const MIN_CAMERA_Z = 50;
+const MAX_CAMERA_Z = 8000;
 
 let isMouseDown = false;
 let mouseX = 0;
@@ -71,14 +74,30 @@ function createPanel() {
 
     carvingLines = [];
 
+    const minWidth = parseFloat(document.getElementById('minWidth').value);
+    const maxWidth = parseFloat(document.getElementById('maxWidth').value);
+
     const globalLinesData = generateGlobalLinesData(
         document.getElementById('pattern').value,
-        width, height, columns, spacing, 
-        parseFloat(document.getElementById('minSpacing').value), 
-        parseFloat(document.getElementById('maxSpacing').value), 
-        parseFloat(document.getElementById('minWidth').value), 
-        parseFloat(document.getElementById('maxWidth').value)
+        width, height, columns, spacing,
+        parseFloat(document.getElementById('minSpacing').value),
+        parseFloat(document.getElementById('maxSpacing').value),
+        minWidth,
+        maxWidth
     );
+
+    currentLinesData = globalLinesData;
+    globalLinesData.forEach(line => {
+        if (line.hasOwnProperty('y')) {
+            carvingLines.push([{ start: { x: -width / 2, y: line.y }, end: { x: width / 2, y: line.y } }]);
+        } else if (line.hasOwnProperty('x')) {
+            carvingLines.push([{ start: { x: line.x, y: -height / 2 }, end: { x: line.x, y: height / 2 } }]);
+        }
+    });
+
+    // Pick segment density adaptively: ~4 segments across the smallest line width,
+    // capped so we don't blow up the vertex count for large multi-cell panels.
+    const segPerMM = Math.max(0.05, 4 / Math.max(1, minWidth));
 
     let xOffset = -width / 2 + columnWidths[0] / 2;
     for (let i = 0; i < columns; i++) {
@@ -100,7 +119,9 @@ function createPanel() {
 
         let yOffset = -height / 2 + rowHeights[0] / 2;
         for (let j = 0; j < rows; j++) {
-            const geometry = new THREE.BoxGeometry(columnWidths[i], rowHeights[j], thickness, 400, 400, 1);
+            const wSegs = Math.min(300, Math.max(20, Math.ceil(columnWidths[i] * segPerMM)));
+            const hSegs = Math.min(300, Math.max(20, Math.ceil(rowHeights[j] * segPerMM)));
+            const geometry = new THREE.BoxGeometry(columnWidths[i], rowHeights[j], thickness, wSegs, hSegs, 1);
             const material = new THREE.MeshPhongMaterial({ color: panelColor });
             const newPanel = new THREE.Mesh(geometry, material);
             newPanel.position.set(
@@ -233,25 +254,15 @@ function applyGlobalLinesToPanel(geometry, width, height, thickness, linesData, 
 
     linesData.forEach(line => {
         if (line.hasOwnProperty('y')) {
-            let y = line.y - yOffset;
-
-            if (isOrganicEnabled) {
-                // drawOrganicLine function was here
-            } else {
-                drawLineVertices(geometry, -width / 2, width / 2, y, line.lineWidth, line.lineDepth, false, thickness, vertexDisplacement);
-            }
+            const y = line.y - yOffset;
+            drawLineVertices(geometry, -width / 2, width / 2, y, line.lineWidth, line.lineDepth, false, thickness, vertexDisplacement);
         }
     });
 
     linesData.forEach(line => {
         if (line.hasOwnProperty('x')) {
-            let x = line.x - xOffset;
-
-            if (isOrganicEnabled) {
-                // drawOrganicLine function was here
-            } else {
-                drawLineVertices(geometry, -height / 2, height / 2, x, line.lineWidth, line.lineDepth, true, thickness, vertexDisplacement);
-            }
+            const x = line.x - xOffset;
+            drawLineVertices(geometry, -height / 2, height / 2, x, line.lineWidth, line.lineDepth, true, thickness, vertexDisplacement);
         }
     });
 
@@ -286,15 +297,7 @@ function drawLineVertices(geometry, start, end, fixedCoord, lineWidth, lineDepth
     }
 }
 
-function selectPresetColor() {
-    const colorPicker = document.getElementById('panelColor');
-    const presetColors = document.getElementById('presetColors');
-    colorPicker.value = presetColors.value;
-    updatePanel();
-}
-
 function updatePanel() {
-    clearScene();
     createPanel();
     resetView();
 }
@@ -315,12 +318,6 @@ function fitPanelToView() {
     const distance = fitHeightDistance > fitWidthDistance ? fitHeightDistance : fitWidthDistance;
     camera.position.set(0, 0, distance * 1.2);
     camera.lookAt(box.getCenter(new THREE.Vector3()));
-}
-
-function toggleOrganic() {
-    isOrganicEnabled = !isOrganicEnabled;
-    document.getElementById('toggleOrganic').textContent = isOrganicEnabled ? 'Straight Lines' : 'Organic Lines';
-    updatePanel();
 }
 
 function onMouseDown(event) {
@@ -347,7 +344,9 @@ function onMouseUp() {
 }
 
 function onMouseWheel(event) {
-    camera.position.z += event.deltaY;
+    event.preventDefault();
+    const next = camera.position.z + event.deltaY;
+    camera.position.z = Math.min(MAX_CAMERA_Z, Math.max(MIN_CAMERA_Z, next));
 }
 
 function onWindowResize() {
@@ -507,6 +506,8 @@ async function exportZip() {
     const pdfBlob = await generatePDFBlob();
     zip.file('panel_report.pdf', pdfBlob);
 
+    zip.file('panel.gcode', generateCNCCode());
+
     zip.generateAsync({ type: 'blob' }).then(function(content) {
         const link = document.createElement('a');
         link.href = URL.createObjectURL(content);
@@ -517,8 +518,54 @@ async function exportZip() {
     });
 }
 
+function generateCNCCode() {
+    const width = parseFloat(document.getElementById('width').value);
+    const height = parseFloat(document.getElementById('height').value);
+    const safeZ = 5;
+    const plungeFeed = 200;
+    const cutFeed = 800;
+
+    const lines = [];
+    lines.push('; G-code generated by 3D Panel Designer');
+    lines.push(`; Panel: ${width} x ${height} mm`);
+    lines.push(`; Carvings: ${currentLinesData.length}`);
+    lines.push('G21 ; mm');
+    lines.push('G90 ; absolute');
+    lines.push('G17 ; XY plane');
+    lines.push('M3 S12000 ; spindle on');
+    lines.push(`G0 Z${safeZ}`);
+
+    currentLinesData.forEach(line => {
+        const depth = (-line.lineDepth).toFixed(3);
+        if (line.hasOwnProperty('y')) {
+            const y = (line.y + height / 2).toFixed(3);
+            lines.push(`G0 X0.000 Y${y}`);
+            lines.push(`G1 Z${depth} F${plungeFeed}`);
+            lines.push(`G1 X${width.toFixed(3)} Y${y} F${cutFeed}`);
+            lines.push(`G0 Z${safeZ}`);
+        } else if (line.hasOwnProperty('x')) {
+            const x = (line.x + width / 2).toFixed(3);
+            lines.push(`G0 X${x} Y0.000`);
+            lines.push(`G1 Z${depth} F${plungeFeed}`);
+            lines.push(`G1 X${x} Y${height.toFixed(3)} F${cutFeed}`);
+            lines.push(`G0 Z${safeZ}`);
+        }
+    });
+
+    lines.push('M5 ; spindle off');
+    lines.push('M30 ; end');
+    return lines.join('\n');
+}
+
 function exportCNC() {
-    alert('CNC export functionality not implemented yet.');
+    const gcode = generateCNCCode();
+    const blob = new Blob([gcode], { type: 'text/plain' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'panel.gcode';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 }
 
 function calculateCarvingLength() {
