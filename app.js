@@ -42,7 +42,27 @@ function readStyleOpts() {
         organicFreq: parseFloat((document.getElementById('organicFreq') || { value: 0.02 }).value),
         mishimaEnabled: !!(document.getElementById('mishimaEnabled') && document.getElementById('mishimaEnabled').checked),
         mishimaProb: parseFloat((document.getElementById('mishimaProb') || { value: 1 }).value),
+        handDrawn: !!(document.getElementById('handDrawn') && document.getElementById('handDrawn').checked),
+        widthVariance: parseFloat((document.getElementById('widthVariance') || { value: 0 }).value),
+        partialProb: parseFloat((document.getElementById('partialProb') || { value: 0 }).value),
     };
+}
+
+function decorateLine(line, opts) {
+    line.tool = opts.toolMode === 'random'
+        ? TOOL_NAMES[Math.floor(Math.random() * TOOL_NAMES.length)]
+        : (opts.tool || 'cosine');
+    line.organic = !!opts.organic;
+    line.organicAmp = opts.organicAmp || 0;
+    line.organicFreq = opts.organicFreq || 0.02;
+    line.seed = Math.random() * 1000;
+    line.mishima = !!(opts.mishimaEnabled && Math.random() < (opts.mishimaProb != null ? opts.mishimaProb : 1));
+    line.handDrawn = !!opts.handDrawn;
+    line.widthVariance = opts.widthVariance || 0;
+    line.partialProb = opts.partialProb || 0;
+    line.widthSeed = Math.random() * 1000;
+    line.maskSeed = Math.random() * 1000;
+    return line;
 }
 
 function init() {
@@ -275,17 +295,7 @@ function generateGlobalLinesData(patternType, width, height, columns, spacing, m
     const opts = styleOpts || {};
     const linesData = [];
 
-    const decorate = (line) => {
-        line.tool = opts.toolMode === 'random'
-            ? TOOL_NAMES[Math.floor(Math.random() * TOOL_NAMES.length)]
-            : (opts.tool || 'cosine');
-        line.organic = !!opts.organic;
-        line.organicAmp = opts.organicAmp || 0;
-        line.organicFreq = opts.organicFreq || 0.02;
-        line.seed = Math.random() * 1000;
-        line.mishima = !!(opts.mishimaEnabled && Math.random() < (opts.mishimaProb != null ? opts.mishimaProb : 1));
-        return line;
-    };
+    const decorate = (line) => decorateLine(line, opts);
 
     if (patternType === 'horizontal') {
         let y = -height / 2;
@@ -437,6 +447,239 @@ function applyGlobalLinesToPanel(geometry, width, height, thickness, linesData, 
     return vertexDisplacement;
 }
 
+function buildVaseProfile(height, baseRadius, bulge, neck, numPoints) {
+    const points = [];
+    for (let p = 0; p <= numPoints; p++) {
+        const t = p / numPoints;
+        const y = -height / 2 + t * height;
+        const bellyEnvelope = Math.sin(Math.PI * t);
+        const taper = 1 - neck * t;
+        const foot = 0.7 + 0.3 * Math.min(1, t * 5);
+        const r = baseRadius * foot * (1 + bulge * bellyEnvelope * 0.5) * taper;
+        points.push(new THREE.Vector2(Math.max(1, r), y));
+    }
+    return points;
+}
+
+function generateVaseCarvings(pattern, vaseHeight, baseCircumference, minSpacing, maxSpacing, minWidth, maxWidth, styleOpts) {
+    const opts = styleOpts || {};
+    const lines = [];
+
+    if (pattern === 'horizontal' || pattern === 'cross') {
+        let y = -vaseHeight / 2;
+        const maxY = vaseHeight / 2;
+        while (y < maxY) {
+            const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
+            const lineDepth = lineWidth / 3;
+            lines.push(decorateLine({ type: 'ring', y, lineWidth, lineDepth }, opts));
+            y += lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
+        }
+    }
+    if (pattern === 'vertical' || pattern === 'cross') {
+        const stepArc = (minSpacing + maxSpacing) / 2;
+        let theta = 0;
+        const twoPi = 2 * Math.PI;
+        let safety = 0;
+        while (theta < twoPi && safety++ < 500) {
+            const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
+            const lineDepth = lineWidth / 3;
+            // For hand-drawn look: stripes sometimes don't span full height
+            let yStart = -vaseHeight / 2;
+            let yEnd = vaseHeight / 2;
+            if (opts.handDrawn && Math.random() < 0.5) {
+                const a = Math.random();
+                const b = Math.random();
+                yStart = -vaseHeight / 2 + Math.min(a, b) * vaseHeight;
+                yEnd = -vaseHeight / 2 + Math.max(a, b) * vaseHeight;
+            }
+            lines.push(decorateLine({ type: 'stripe', theta, yStart, yEnd, lineWidth, lineDepth }, opts));
+            const arcStep = lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
+            theta += (arcStep / baseCircumference) * twoPi;
+        }
+    }
+
+    return lines;
+}
+
+function applyCarvingsToLathe(geometry, carvings, vaseHeight, useMishima) {
+    const positions = geometry.attributes.position;
+    const N = positions.count;
+    const vertexDepth = new Float32Array(N);
+    const vertexInlay = useMishima ? new Uint8Array(N) : null;
+
+    for (let i = 0; i < N; i++) {
+        const x = positions.getX(i);
+        const y = positions.getY(i);
+        const z = positions.getZ(i);
+        const r = Math.sqrt(x * x + z * z);
+        if (r < 0.01) continue;
+        const theta = Math.atan2(z, x);
+
+        for (let li = 0; li < carvings.length; li++) {
+            const line = carvings[li];
+
+            if (line.type === 'ring') {
+                let centerY = line.y;
+                if (line.organic && line.organicAmp) {
+                    centerY += line.organicAmp * simplex.noise2D(theta * 4, line.seed);
+                }
+                let lineWidth = line.lineWidth;
+                if (line.handDrawn && line.widthVariance) {
+                    lineWidth *= Math.max(0.2, 1 + line.widthVariance * simplex.noise2D(theta * 2.5, line.widthSeed));
+                }
+                const halfW = Math.max(0.4, lineWidth / 2);
+                if (line.handDrawn && line.partialProb) {
+                    const m = (simplex.noise2D(theta * 1.3, line.maskSeed) + 1) * 0.5;
+                    if (m < line.partialProb) continue;
+                }
+                const dist = Math.abs(y - centerY);
+                if (dist >= halfW) continue;
+
+                const profile = profileDepthFraction(line.tool || 'cosine', dist / halfW);
+                const newDepth = line.lineDepth * profile;
+                if (newDepth > vertexDepth[i]) {
+                    vertexDepth[i] = newDepth;
+                    if (vertexInlay) vertexInlay[i] = line.mishima ? 1 : 0;
+                }
+
+            } else if (line.type === 'stripe') {
+                if (y < line.yStart || y > line.yEnd) continue;
+                let centerTheta = line.theta;
+                if (line.organic && line.organicAmp) {
+                    centerTheta += (line.organicAmp / Math.max(1, r)) * simplex.noise2D(y * line.organicFreq, line.seed);
+                }
+                let lineWidth = line.lineWidth;
+                if (line.handDrawn && line.widthVariance) {
+                    lineWidth *= Math.max(0.2, 1 + line.widthVariance * simplex.noise2D(y * 0.04, line.widthSeed));
+                }
+                const halfW = Math.max(0.4, lineWidth / 2);
+                if (line.handDrawn && line.partialProb) {
+                    const m = (simplex.noise2D(y * 0.04, line.maskSeed) + 1) * 0.5;
+                    if (m < line.partialProb) continue;
+                }
+                let angDist = Math.abs(theta - centerTheta);
+                if (angDist > Math.PI) angDist = 2 * Math.PI - angDist;
+                const arcDist = r * angDist;
+                if (arcDist >= halfW) continue;
+
+                const profile = profileDepthFraction(line.tool || 'cosine', arcDist / halfW);
+                const newDepth = line.lineDepth * profile;
+                if (newDepth > vertexDepth[i]) {
+                    vertexDepth[i] = newDepth;
+                    if (vertexInlay) vertexInlay[i] = line.mishima ? 1 : 0;
+                }
+            }
+        }
+    }
+
+    // Push displaced vertices radially inward
+    for (let i = 0; i < N; i++) {
+        const d = vertexDepth[i];
+        if (d === 0) continue;
+        const x = positions.getX(i);
+        const z = positions.getZ(i);
+        const r = Math.sqrt(x * x + z * z);
+        if (r < 0.01) continue;
+        const theta = Math.atan2(z, x);
+        const newR = Math.max(0.5, r - d);
+        positions.setX(i, newR * Math.cos(theta));
+        positions.setZ(i, newR * Math.sin(theta));
+    }
+    positions.needsUpdate = true;
+
+    return { vertexDepth, vertexInlay };
+}
+
+function applyInlayColorsLathe(geometry, vertexDepth, vertexInlay, panelColor, inlayColor, maxDepth) {
+    const positions = geometry.attributes.position;
+    const N = positions.count;
+    const colors = new Float32Array(N * 3);
+    const tmp = new THREE.Color();
+    const safeMax = maxDepth > 0 ? maxDepth : 1;
+    for (let i = 0; i < N; i++) {
+        if (vertexInlay && vertexInlay[i]) {
+            const factor = Math.min(1, vertexDepth[i] / safeMax);
+            tmp.copy(panelColor).lerp(inlayColor, factor);
+            colors[i * 3] = tmp.r;
+            colors[i * 3 + 1] = tmp.g;
+            colors[i * 3 + 2] = tmp.b;
+        } else {
+            colors[i * 3] = panelColor.r;
+            colors[i * 3 + 1] = panelColor.g;
+            colors[i * 3 + 2] = panelColor.b;
+        }
+    }
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+}
+
+function createVase() {
+    clearScene();
+
+    const height = parseFloat(document.getElementById('vaseHeight').value);
+    const baseRadius = parseFloat(document.getElementById('vaseRadius').value);
+    const bulge = parseFloat(document.getElementById('vaseBulge').value);
+    const neck = parseFloat(document.getElementById('vaseNeck').value);
+    const vaseColor = new THREE.Color(document.getElementById('vaseColor').value);
+
+    const profilePoints = buildVaseProfile(height, baseRadius, bulge, neck, 100);
+    const radialSegments = 300;
+    const geometry = new THREE.LatheGeometry(profilePoints, radialSegments);
+
+    const styleOpts = readStyleOpts();
+    const pattern = document.getElementById('pattern').value;
+    const minSpacing = parseFloat(document.getElementById('minSpacing').value);
+    const maxSpacing = parseFloat(document.getElementById('maxSpacing').value);
+    const minWidth = parseFloat(document.getElementById('minWidth').value);
+    const maxWidth = parseFloat(document.getElementById('maxWidth').value);
+
+    const carvings = generateVaseCarvings(
+        pattern, height, 2 * Math.PI * baseRadius,
+        minSpacing, maxSpacing, minWidth, maxWidth, styleOpts
+    );
+
+    const useMishima = styleOpts.mishimaEnabled;
+    const inlayColor = new THREE.Color(document.getElementById('inlayColor').value);
+    const maxLineDepth = carvings.reduce((m, l) => Math.max(m, l.lineDepth), 0) || 1;
+
+    const result = applyCarvingsToLathe(geometry, carvings, height, useMishima);
+    geometry.computeVertexNormals();
+
+    const material = new THREE.MeshPhongMaterial({
+        color: vaseColor,
+        vertexColors: useMishima,
+        side: THREE.DoubleSide,
+        shininess: 60,
+    });
+    if (useMishima) {
+        applyInlayColorsLathe(geometry, result.vertexDepth, result.vertexInlay, vaseColor, inlayColor, maxLineDepth);
+    }
+
+    const vase = new THREE.Mesh(geometry, material);
+    scene.add(vase);
+
+    // Carving length for PDF: rings × circumference, stripes × span
+    carvingLines = [];
+    currentLinesData = carvings;
+    carvings.forEach(line => {
+        if (line.type === 'ring') {
+            // approximate radius at line.y by sampling profile
+            let r = baseRadius;
+            for (let p = 0; p < profilePoints.length - 1; p++) {
+                if (profilePoints[p].y <= line.y && profilePoints[p + 1].y >= line.y) {
+                    r = (profilePoints[p].x + profilePoints[p + 1].x) / 2;
+                    break;
+                }
+            }
+            const halfC = Math.PI * r;
+            carvingLines.push([{ start: { x: -halfC, y: line.y }, end: { x: halfC, y: line.y } }]);
+        } else if (line.type === 'stripe') {
+            carvingLines.push([{ start: { x: line.theta * baseRadius, y: line.yStart }, end: { x: line.theta * baseRadius, y: line.yEnd } }]);
+        }
+    });
+
+    fitPanelToView();
+}
+
 function applyInlayColors(geometry, displacement, inlayMask, panelColor, inlayColor, maxDepth, thickness) {
     const positions = geometry.attributes.position;
     const colors = new Float32Array(positions.count * 3);
@@ -462,8 +705,23 @@ function applyInlayColors(geometry, displacement, inlayMask, panelColor, inlayCo
 }
 
 function updatePanel() {
-    createPanel();
+    const modeEl = document.getElementById('formMode');
+    const mode = modeEl ? modeEl.value : 'panel';
+    if (mode === 'vase') {
+        createVase();
+    } else {
+        createPanel();
+    }
     resetView();
+}
+
+function onFormModeChange() {
+    const mode = document.getElementById('formMode').value;
+    const panelStep = document.getElementById('step1-panel');
+    const vaseStep = document.getElementById('step1b-vase');
+    if (panelStep) panelStep.style.display = mode === 'panel' ? '' : 'none';
+    if (vaseStep) vaseStep.style.display = mode === 'vase' ? '' : 'none';
+    updatePanel();
 }
 
 function resetView() {
@@ -683,6 +941,12 @@ async function exportZip() {
 }
 
 function generateCNCCode() {
+    const modeEl = document.getElementById('formMode');
+    const mode = modeEl ? modeEl.value : 'panel';
+    if (mode === 'vase') {
+        return '; G-code export is only supported for Panel mode\n; Vases require a 4-axis lathe CNC and aren\'t handled yet\n';
+    }
+
     const width = parseFloat(document.getElementById('width').value);
     const height = parseFloat(document.getElementById('height').value);
     const safeZ = 5;
