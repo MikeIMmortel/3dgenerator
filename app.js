@@ -16,6 +16,35 @@ let targetRotationY = 0;
 const DEFAULT_PANEL_COLOR = 0xFF8C00;
 const noiseScaleValues = [0.005, 0.01, 0.015, 0.02, 0.025];
 
+// Cross-section profiles for carving "tools". Input t = distance / (lineWidth/2),
+// expected to be in [0, 1]. Output is a depth fraction in [0, 1] where 1 = max depth.
+const TOOL_PROFILES = {
+    cosine: (t) => Math.cos(Math.PI * t / 2),    // current behavior — broad U-groove
+    vee:    (t) => 1 - Math.abs(t),              // sharp V-groove
+    square: () => 1,                             // flat-bottom rectangular pocket
+    round:  (t) => Math.sqrt(Math.max(0, 1 - t * t)),  // semicircle
+};
+const TOOL_NAMES = ['cosine', 'vee', 'square', 'round'];
+
+function profileDepthFraction(toolName, t) {
+    const fn = TOOL_PROFILES[toolName] || TOOL_PROFILES.cosine;
+    return fn(Math.min(1, Math.max(0, t)));
+}
+
+function readStyleOpts() {
+    const toolEl = document.getElementById('toolSelect');
+    const toolValue = toolEl ? toolEl.value : 'cosine';
+    return {
+        toolMode: toolValue === 'random' ? 'random' : 'fixed',
+        tool: toolValue === 'random' ? 'cosine' : toolValue,
+        organic: !!(document.getElementById('organicEnabled') && document.getElementById('organicEnabled').checked),
+        organicAmp: parseFloat((document.getElementById('organicAmp') || { value: 0 }).value),
+        organicFreq: parseFloat((document.getElementById('organicFreq') || { value: 0.02 }).value),
+        mishimaEnabled: !!(document.getElementById('mishimaEnabled') && document.getElementById('mishimaEnabled').checked),
+        mishimaProb: parseFloat((document.getElementById('mishimaProb') || { value: 1 }).value),
+    };
+}
+
 function init() {
     scene = new THREE.Scene();
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10000);
@@ -82,23 +111,31 @@ function createPanel() {
     const minWidth = parseFloat(document.getElementById('minWidth').value);
     const maxWidth = parseFloat(document.getElementById('maxWidth').value);
 
+    const styleOpts = readStyleOpts();
+
     const globalLinesData = generateGlobalLinesData(
         document.getElementById('pattern').value,
         width, height, columns, spacing,
         parseFloat(document.getElementById('minSpacing').value),
         parseFloat(document.getElementById('maxSpacing').value),
         minWidth,
-        maxWidth
+        maxWidth,
+        styleOpts
     );
 
     currentLinesData = globalLinesData;
     globalLinesData.forEach(line => {
-        if (line.hasOwnProperty('y')) {
-            carvingLines.push([{ start: { x: -width / 2, y: line.y }, end: { x: width / 2, y: line.y } }]);
-        } else if (line.hasOwnProperty('x')) {
-            carvingLines.push([{ start: { x: line.x, y: -height / 2 }, end: { x: line.x, y: height / 2 } }]);
+        const samples = sampleLineCenterline(line, width, height);
+        const segments = [];
+        for (let s = 0; s < samples.length - 1; s++) {
+            segments.push({ start: samples[s], end: samples[s + 1] });
         }
+        carvingLines.push(segments);
     });
+
+    const useMishima = styleOpts.mishimaEnabled;
+    const inlayColor = new THREE.Color(document.getElementById('inlayColor').value);
+    const maxLineDepth = globalLinesData.reduce((m, l) => Math.max(m, l.lineDepth), 0) || 1;
 
     // Pick segment density adaptively: ~4 segments across the smallest line width,
     // capped so we don't blow up the vertex count for large multi-cell panels.
@@ -130,7 +167,7 @@ function createPanel() {
             const wSegs = Math.min(300, Math.max(20, Math.ceil(columnWidths[i] * segPerMM)));
             const hSegs = Math.min(300, Math.max(20, Math.ceil(rowHeights[j] * segPerMM)));
             const geometry = new THREE.BoxGeometry(columnWidths[i], rowHeights[j], thickness, wSegs, hSegs, 1);
-            const material = new THREE.MeshPhongMaterial({ color: panelColor });
+            const material = new THREE.MeshPhongMaterial({ color: panelColor, vertexColors: useMishima });
             const newPanel = new THREE.Mesh(geometry, material);
             newPanel.position.set(
                 xOffset,
@@ -139,7 +176,14 @@ function createPanel() {
             );
             scene.add(newPanel);
 
-            applyGlobalLinesToPanel(geometry, columnWidths[i], rowHeights[j], thickness, globalLinesData, xOffset, yOffset);
+            const inlayMask = useMishima ? new Map() : null;
+            const displacement = applyGlobalLinesToPanel(
+                geometry, columnWidths[i], rowHeights[j], thickness,
+                globalLinesData, xOffset, yOffset, width, height, inlayMask
+            );
+            if (useMishima) {
+                applyInlayColors(geometry, displacement, inlayMask, panelColor, inlayColor, maxLineDepth, thickness);
+            }
 
             geometry.computeVertexNormals();
             yOffset += rowHeights[j] / 2 + (j < rows - 1 ? rowHeights[j + 1] / 2 : 0) + spacingHorizontal;
@@ -227,8 +271,21 @@ function onInputChange(inputId) {
 
 updateColumnInputs();
 
-function generateGlobalLinesData(patternType, width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth) {
+function generateGlobalLinesData(patternType, width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth, styleOpts) {
+    const opts = styleOpts || {};
     const linesData = [];
+
+    const decorate = (line) => {
+        line.tool = opts.toolMode === 'random'
+            ? TOOL_NAMES[Math.floor(Math.random() * TOOL_NAMES.length)]
+            : (opts.tool || 'cosine');
+        line.organic = !!opts.organic;
+        line.organicAmp = opts.organicAmp || 0;
+        line.organicFreq = opts.organicFreq || 0.02;
+        line.seed = Math.random() * 1000;
+        line.mishima = !!(opts.mishimaEnabled && Math.random() < (opts.mishimaProb != null ? opts.mishimaProb : 1));
+        return line;
+    };
 
     if (patternType === 'horizontal') {
         let y = -height / 2;
@@ -236,7 +293,7 @@ function generateGlobalLinesData(patternType, width, height, columns, spacing, m
         while (y < maxY) {
             const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
             const lineDepth = lineWidth / 3;
-            linesData.push({ y, lineWidth, lineDepth });
+            linesData.push(decorate({ y, lineWidth, lineDepth }));
             y += lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
         }
     } else if (patternType === 'vertical') {
@@ -245,64 +302,163 @@ function generateGlobalLinesData(patternType, width, height, columns, spacing, m
         while (x < maxX) {
             const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
             const lineDepth = lineWidth / 3;
-            linesData.push({ x, lineWidth, lineDepth });
+            linesData.push(decorate({ x, lineWidth, lineDepth }));
             x += lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
         }
     } else if (patternType === 'cross') {
-        generateGlobalLinesData('horizontal', width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth).forEach(line => linesData.push(line));
-        generateGlobalLinesData('vertical', width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth).forEach(line => linesData.push(line));
+        generateGlobalLinesData('horizontal', width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth, opts).forEach(line => linesData.push(line));
+        generateGlobalLinesData('vertical', width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth, opts).forEach(line => linesData.push(line));
     }
 
     return linesData;
 }
 
-function applyGlobalLinesToPanel(geometry, width, height, thickness, linesData, xOffset, yOffset) {
+// Returns polyline samples for a line in panel-global coords (origin at panel center).
+// Straight line -> 2 samples (start, end). Organic -> stepped samples along simplex-noise wave.
+function sampleLineCenterline(line, panelW, panelH) {
+    const isVertical = line.hasOwnProperty('x');
+    const baseCoord = isVertical ? line.x : line.y;
+    const along0 = isVertical ? -panelH / 2 : -panelW / 2;
+    const along1 = isVertical ? panelH / 2 : panelW / 2;
+
+    if (!line.organic || !line.organicAmp) {
+        if (isVertical) return [{ x: baseCoord, y: along0 }, { x: baseCoord, y: along1 }];
+        return [{ x: along0, y: baseCoord }, { x: along1, y: baseCoord }];
+    }
+
+    const step = Math.max(0.5, Math.min(2, line.lineWidth));
+    const seed = line.seed || 0;
+    const freq = line.organicFreq;
+    const amp = line.organicAmp;
+    const samples = [];
+    let along = along0;
+    while (along < along1) {
+        const offset = amp * simplex.noise2D(along * freq, seed);
+        if (isVertical) samples.push({ x: baseCoord + offset, y: along });
+        else samples.push({ x: along, y: baseCoord + offset });
+        along += step;
+    }
+    const endOffset = amp * simplex.noise2D(along1 * freq, seed);
+    if (isVertical) samples.push({ x: baseCoord + endOffset, y: along1 });
+    else samples.push({ x: along1, y: baseCoord + endOffset });
+    return samples;
+}
+
+function applyGlobalLinesToPanel(geometry, width, height, thickness, linesData, xOffset, yOffset, panelW, panelH, vertexInlayMask) {
     const positions = geometry.attributes.position;
     const vertexDisplacement = new Map();
 
-    linesData.forEach(line => {
-        if (line.hasOwnProperty('y')) {
-            const y = line.y - yOffset;
-            drawLineVertices(geometry, -width / 2, width / 2, y, line.lineWidth, line.lineDepth, false, thickness, vertexDisplacement);
+    // Cache front-face vertices once to avoid scanning all 6 faces per line.
+    const frontX = [], frontY = [], frontI = [];
+    for (let i = 0; i < positions.count; i++) {
+        if (Math.abs(positions.getZ(i) - thickness / 2) < 0.01) {
+            frontX.push(positions.getX(i));
+            frontY.push(positions.getY(i));
+            frontI.push(i);
         }
-    });
+    }
+    const N = frontI.length;
+
+    // Coarse spatial grid so per-segment lookups don't scan the whole front face.
+    const gridSize = 20;
+    const gridCols = Math.max(1, Math.ceil(width / gridSize)) + 1;
+    const gridRows = Math.max(1, Math.ceil(height / gridSize)) + 1;
+    const grid = new Array(gridCols * gridRows);
+    for (let k = 0; k < N; k++) {
+        const cx = Math.min(gridCols - 1, Math.max(0, Math.floor((frontX[k] + width / 2) / gridSize)));
+        const cy = Math.min(gridRows - 1, Math.max(0, Math.floor((frontY[k] + height / 2) / gridSize)));
+        const g = cy * gridCols + cx;
+        if (!grid[g]) grid[g] = [];
+        grid[g].push(k);
+    }
 
     linesData.forEach(line => {
-        if (line.hasOwnProperty('x')) {
-            const x = line.x - xOffset;
-            drawLineVertices(geometry, -height / 2, height / 2, x, line.lineWidth, line.lineDepth, true, thickness, vertexDisplacement);
+        const samples = sampleLineCenterline(line, panelW, panelH);
+        const halfW = line.lineWidth / 2;
+        const tool = line.tool || 'cosine';
+
+        for (let s = 0; s < samples.length - 1; s++) {
+            // Convert global -> cell-local
+            const ax = samples[s].x - xOffset;
+            const ay = samples[s].y - yOffset;
+            const bx = samples[s + 1].x - xOffset;
+            const by = samples[s + 1].y - yOffset;
+            const dx = bx - ax;
+            const dy = by - ay;
+            const lenSq = dx * dx + dy * dy;
+            if (lenSq === 0) continue;
+
+            const minX = Math.min(ax, bx) - halfW;
+            const maxX = Math.max(ax, bx) + halfW;
+            const minY = Math.min(ay, by) - halfW;
+            const maxY = Math.max(ay, by) + halfW;
+
+            const cxMin = Math.max(0, Math.floor((minX + width / 2) / gridSize));
+            const cxMax = Math.min(gridCols - 1, Math.floor((maxX + width / 2) / gridSize));
+            const cyMin = Math.max(0, Math.floor((minY + height / 2) / gridSize));
+            const cyMax = Math.min(gridRows - 1, Math.floor((maxY + height / 2) / gridSize));
+            if (cxMin > cxMax || cyMin > cyMax) continue;
+
+            for (let cy = cyMin; cy <= cyMax; cy++) {
+                for (let cx = cxMin; cx <= cxMax; cx++) {
+                    const bucket = grid[cy * gridCols + cx];
+                    if (!bucket) continue;
+                    for (let m = 0; m < bucket.length; m++) {
+                        const k = bucket[m];
+                        const vx = frontX[k];
+                        const vy = frontY[k];
+                        if (vx < minX || vx > maxX || vy < minY || vy > maxY) continue;
+                        const t = ((vx - ax) * dx + (vy - ay) * dy) / lenSq;
+                        if (t < 0 || t > 1) continue;
+                        const projX = ax + t * dx;
+                        const projY = ay + t * dy;
+                        const distance = Math.hypot(vx - projX, vy - projY);
+                        if (distance >= halfW) continue;
+
+                        const profile = profileDepthFraction(tool, distance / halfW);
+                        const newZ = thickness / 2 - line.lineDepth * profile;
+                        const idx = frontI[k];
+                        const existingZ = vertexDisplacement.has(idx) ? vertexDisplacement.get(idx) : thickness / 2;
+                        if (newZ < existingZ) {
+                            vertexDisplacement.set(idx, newZ);
+                            if (vertexInlayMask) vertexInlayMask.set(idx, !!line.mishima);
+                        }
+                    }
+                }
+            }
         }
     });
 
     for (let [vertexIndex, displacement] of vertexDisplacement.entries()) {
         positions.setZ(vertexIndex, displacement);
     }
-
     positions.needsUpdate = true;
+
+    return vertexDisplacement;
 }
 
-function drawLineVertices(geometry, start, end, fixedCoord, lineWidth, lineDepth, isVertical, thickness, vertexDisplacement) {
+function applyInlayColors(geometry, displacement, inlayMask, panelColor, inlayColor, maxDepth, thickness) {
     const positions = geometry.attributes.position;
+    const colors = new Float32Array(positions.count * 3);
+    const tmp = new THREE.Color();
+    const safeMax = maxDepth > 0 ? maxDepth : 1;
 
     for (let i = 0; i < positions.count; i++) {
-        const x = positions.getX(i);
-        const y = positions.getY(i);
-        const z = positions.getZ(i);
-
-        if (Math.abs(z - thickness / 2) < 0.01) {
-            let coord = isVertical ? y : x;
-            let distanceToLine = isVertical ? Math.abs(x - fixedCoord) : Math.abs(y - fixedCoord);
-
-            if (coord >= start && coord <= end && distanceToLine < lineWidth / 2) {
-                const newZ = thickness / 2 - lineDepth * Math.cos(Math.PI * distanceToLine / lineWidth);
-                const existingDisplacement = vertexDisplacement.get(i) || thickness / 2;
-
-                if (newZ < existingDisplacement) {
-                    vertexDisplacement.set(i, newZ);
-                }
-            }
+        if (inlayMask.get(i)) {
+            const z = displacement.has(i) ? displacement.get(i) : thickness / 2;
+            const depth = Math.max(0, thickness / 2 - z);
+            const factor = Math.min(1, depth / safeMax);
+            tmp.copy(panelColor).lerp(inlayColor, factor);
+            colors[i * 3] = tmp.r;
+            colors[i * 3 + 1] = tmp.g;
+            colors[i * 3 + 2] = tmp.b;
+        } else {
+            colors[i * 3] = panelColor.r;
+            colors[i * 3 + 1] = panelColor.g;
+            colors[i * 3 + 2] = panelColor.b;
         }
     }
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 }
 
 function updatePanel() {
@@ -544,20 +700,23 @@ function generateCNCCode() {
     lines.push(`G0 Z${safeZ}`);
 
     currentLinesData.forEach(line => {
+        const samples = sampleLineCenterline(line, width, height);
+        if (samples.length < 2) return;
         const depth = (-line.lineDepth).toFixed(3);
-        if (line.hasOwnProperty('y')) {
-            const y = (line.y + height / 2).toFixed(3);
-            lines.push(`G0 X0.000 Y${y}`);
-            lines.push(`G1 Z${depth} F${plungeFeed}`);
-            lines.push(`G1 X${width.toFixed(3)} Y${y} F${cutFeed}`);
-            lines.push(`G0 Z${safeZ}`);
-        } else if (line.hasOwnProperty('x')) {
-            const x = (line.x + width / 2).toFixed(3);
-            lines.push(`G0 X${x} Y0.000`);
-            lines.push(`G1 Z${depth} F${plungeFeed}`);
-            lines.push(`G1 X${x} Y${height.toFixed(3)} F${cutFeed}`);
-            lines.push(`G0 Z${safeZ}`);
+        const tool = line.tool || 'cosine';
+        if (line.mishima) lines.push(`; mishima inlay (visual only)`);
+        lines.push(`; tool profile: ${tool}`);
+        // Convert from panel-center coords to bottom-left corner coords
+        const startX = (samples[0].x + width / 2).toFixed(3);
+        const startY = (samples[0].y + height / 2).toFixed(3);
+        lines.push(`G0 X${startX} Y${startY}`);
+        lines.push(`G1 Z${depth} F${plungeFeed}`);
+        for (let s = 1; s < samples.length; s++) {
+            const sx = (samples[s].x + width / 2).toFixed(3);
+            const sy = (samples[s].y + height / 2).toFixed(3);
+            lines.push(`G1 X${sx} Y${sy} F${cutFeed}`);
         }
+        lines.push(`G0 Z${safeZ}`);
     });
 
     lines.push('M5 ; spindle off');

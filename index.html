@@ -32,7 +32,7 @@
         <!-- Step 2: Pattern -->
         <div class="step" id="step2-pattern">
             <h3>Step 2: Pattern</h3>
-            <label>Pattern: 
+            <label>Pattern:
                 <select id="pattern" onchange="updatePanel()">
                     <option value="horizontal">Horizontal</option>
                     <option value="vertical">Vertical</option>
@@ -43,6 +43,26 @@
             <label>Max Spacing: <input type="number" id="maxSpacing" value="50" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
             <label>Min Width: <input type="number" id="minWidth" value="5" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
             <label>Max Width: <input type="number" id="maxWidth" value="15" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
+        </div>
+
+        <!-- Step 2b: Style -->
+        <div class="step" id="step2b-style">
+            <h3>Step 2b: Style</h3>
+            <label>Tool:
+                <select id="toolSelect" onchange="updatePanel()">
+                    <option value="cosine" selected>U-groove (cosine)</option>
+                    <option value="vee">V-groove</option>
+                    <option value="square">Square</option>
+                    <option value="round">Round</option>
+                    <option value="random">Random per line</option>
+                </select>
+            </label><br>
+            <label><input type="checkbox" id="organicEnabled" onchange="updatePanel()"> Organic lines</label><br>
+            <label>Wave amplitude (mm): <input type="range" id="organicAmp" min="0" max="20" step="0.5" value="5" onchange="updatePanel()"></label><br>
+            <label>Wave frequency: <input type="range" id="organicFreq" min="0.001" max="0.05" step="0.001" value="0.02" onchange="updatePanel()"></label><br>
+            <label><input type="checkbox" id="mishimaEnabled" onchange="updatePanel()"> Mishima inlay</label><br>
+            <label>Inlay color: <input type="color" id="inlayColor" value="#1a1a1a" onchange="updatePanel()"></label><br>
+            <label>Mishima probability: <input type="range" id="mishimaProb" min="0" max="1" step="0.05" value="1" onchange="updatePanel()"></label><br>
         </div>
 
         <!-- Step 3: Export -->
