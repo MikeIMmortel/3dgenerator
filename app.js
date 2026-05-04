@@ -144,7 +144,7 @@ function init() {
 
 // === Stroke generation ===
 function generateStrokes(panelW, panelH, params, rng) {
-    const { strokeWidthMm, densityPerArea, placement, pattern, scaleFreq, layers } = params;
+    const { strokeWidthMm, densityPerArea, placement, pattern, strokeLength, scaleFreq, layers } = params;
     const area = (panelW * panelH) / 10000; // in 100x100mm units
     const strokesPerLayer = Math.max(2, Math.round(densityPerArea * area));
     const strokeStepMm = Math.max(0.5, strokeWidthMm * 0.5);
@@ -152,28 +152,54 @@ function generateStrokes(panelW, panelH, params, rng) {
 
     const simplexInst = new SimplexNoise(rng);
 
+    const lengthMul = strokeLength === 'short' ? 0.45 :
+                      strokeLength === 'long' ? 3.5 : 1.0;
+    const traceBoth = strokeLength === 'long';
+    const margin = 8; // mm — strokes may briefly exit the panel and curl back
+
     const strokes = [];
     for (let layer = 0; layer < layers; layer++) {
         for (let i = 0; i < strokesPerLayer; i++) {
             const seedPt = pickSeedPoint(placement, panelW, panelH, i, strokesPerLayer, densityPerArea, rng);
-            let x = seedPt.x;
-            let y = seedPt.y;
-
-            const lengthFactor = strokeLengthFactor(placement);
-            const points = [];
+            const lengthFactor = strokeLengthFactor(placement) * lengthMul;
             const maxSteps = Math.floor((strokeMaxLength * lengthFactor) / strokeStepMm);
-            const stepCount = Math.max(6, Math.floor(maxSteps * (0.4 + rng() * 0.6)));
+            const stepCount = Math.max(6, Math.floor(maxSteps * (0.5 + rng() * 0.5)));
             const baseWidth = strokeWidthMm * (0.85 + rng() * 0.3);
 
+            const points = [];
+
+            // Forward trace from seed
+            let fx = seedPt.x, fy = seedPt.y;
             for (let s = 0; s < stepCount; s++) {
-                if (!inPlacementRegion(placement, x, y, panelW, panelH)) break;
-                points.push({ x, y, w: baseWidth });
-                const ang = patternFlowAngle(pattern, x, y, simplexInst, scaleFreq, panelW, panelH);
-                x += Math.cos(ang) * strokeStepMm;
-                y += Math.sin(ang) * strokeStepMm;
-                if (x < -panelW / 2 - 20 || x > panelW / 2 + 20 ||
-                    y < -panelH / 2 - 20 || y > panelH / 2 + 20) break;
+                if (!inPlacementRegion(placement, fx, fy, panelW, panelH)) break;
+                if (fx < -panelW / 2 - margin || fx > panelW / 2 + margin ||
+                    fy < -panelH / 2 - margin || fy > panelH / 2 + margin) break;
+                points.push({ x: fx, y: fy, w: baseWidth });
+                const ang = patternFlowAngle(pattern, fx, fy, simplexInst, scaleFreq, panelW, panelH);
+                fx += Math.cos(ang) * strokeStepMm;
+                fy += Math.sin(ang) * strokeStepMm;
             }
+
+            // Backward trace from seed (only when "long") — extends the stroke
+            // to the opposite panel edge so a single line spans the full panel.
+            if (traceBoth) {
+                const backward = [];
+                let bx = seedPt.x, by = seedPt.y;
+                for (let s = 0; s < stepCount; s++) {
+                    const ang = patternFlowAngle(pattern, bx, by, simplexInst, scaleFreq, panelW, panelH);
+                    bx -= Math.cos(ang) * strokeStepMm;
+                    by -= Math.sin(ang) * strokeStepMm;
+                    if (!inPlacementRegion(placement, bx, by, panelW, panelH)) break;
+                    if (bx < -panelW / 2 - margin || bx > panelW / 2 + margin ||
+                        by < -panelH / 2 - margin || by > panelH / 2 + margin) break;
+                    backward.push({ x: bx, y: by, w: baseWidth });
+                }
+                if (backward.length > 0) {
+                    backward.reverse();
+                    points.unshift(...backward);
+                }
+            }
+
             if (points.length >= 2) strokes.push(points);
         }
     }
@@ -438,6 +464,7 @@ function createPanel() {
 
     const panelW = parseFloat(document.getElementById('width').value);
     const panelH = parseFloat(document.getElementById('height').value);
+    const panelThickness = Math.max(1, parseFloat(document.getElementById('panelThickness').value) || 18);
     const columns = parseInt(document.getElementById('columns').value);
     const spacing = parseFloat(document.getElementById('spacing').value);
     const spacingHorizontal = parseFloat(document.getElementById('spacingHorizontal').value);
@@ -448,6 +475,8 @@ function createPanel() {
     const placement = document.getElementById('placement').value;
     const patternEl = document.getElementById('pattern');
     const pattern = patternEl ? patternEl.value : 'flow';
+    const strokeLengthEl = document.getElementById('strokeLength');
+    const strokeLength = strokeLengthEl ? strokeLengthEl.value : 'normal';
     const thicknessLevel = parseInt(document.getElementById('strokeThickness').value);
     const densityLevel = parseInt(document.getElementById('density').value);
     const scaleKey = document.getElementById('patternScale').value;
@@ -463,7 +492,7 @@ function createPanel() {
     const rng = mulberry32(seed);
 
     const strokes = generateStrokes(panelW, panelH, {
-        strokeWidthMm, densityPerArea, placement, pattern, scaleFreq, layers,
+        strokeWidthMm, densityPerArea, placement, pattern, strokeLength, scaleFreq, layers,
     }, rng);
 
     renderDepthCanvas(panelW, panelH, strokes, bit, frame);
@@ -510,16 +539,25 @@ function createPanel() {
             const cellH = rowHeights[j];
             const wSegs = Math.min(PLANE_SEG_CAP, Math.max(20, Math.ceil(cellW * PLANE_SEG_PER_MM)));
             const hSegs = Math.min(PLANE_SEG_CAP, Math.max(20, Math.ceil(cellH * PLANE_SEG_PER_MM)));
-            const geometry = new THREE.PlaneGeometry(cellW, cellH, wSegs, hSegs);
+            // BoxGeometry gives the panel real thickness (front + back + 4 sides).
+            // depthSegments=1 keeps side-wall vertex count low.
+            const geometry = new THREE.BoxGeometry(cellW, cellH, panelThickness, wSegs, hSegs, 1);
             const positions = geometry.attributes.position;
+            const halfT = panelThickness / 2;
 
             for (let v = 0; v < positions.count; v++) {
-                const vx = positions.getX(v);
-                const vy = positions.getY(v);
-                const px = xOffset + vx;
-                const py = yOffset + vy;
-                const depth = sampleDepth(imageData, cw, ch, panelW, panelH, px, py);
-                positions.setZ(v, -depth);
+                const vz = positions.getZ(v);
+                // Only the front face vertices (z ≈ +T/2) get displaced. Back face,
+                // edges and side walls keep their original z so the panel keeps a
+                // proper MDF-block silhouette.
+                if (Math.abs(vz - halfT) < 0.01) {
+                    const vx = positions.getX(v);
+                    const vy = positions.getY(v);
+                    const px = xOffset + vx;
+                    const py = yOffset + vy;
+                    const depth = sampleDepth(imageData, cw, ch, panelW, panelH, px, py);
+                    positions.setZ(v, halfT - depth);
+                }
             }
             positions.needsUpdate = true;
             geometry.computeVertexNormals();
@@ -534,6 +572,9 @@ function createPanel() {
                 reflectivity: 0.4,
                 side: THREE.FrontSide,
             });
+            // Side walls get a slightly rougher version so the cut edge of MDF
+            // reads as un-finished compared to the silk-gloss faces.
+            // (kept simple: same material on all faces for v1)
             const mesh = new THREE.Mesh(geometry, material);
             mesh.position.set(xOffset, yOffset, 0);
             scene.add(mesh);
