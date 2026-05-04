@@ -30,14 +30,18 @@ const RAL_PALETTE = [
     { code: 'RAL 8017', name: 'Chocoladebruin', hex: '#45322E' },
 ];
 
-const THICKNESS_MM = { 1: 1.5, 2: 3, 3: 5, 4: 8, 5: 12 };
 const DENSITY_PER_AREA = { 1: 0.25, 2: 0.7, 3: 1.8, 4: 4, 5: 9 }; // strokes per 100x100mm
 const SCALE_FREQ = { macro: 0.003, medium: 0.008, micro: 0.02 };
 
-const MAX_DEPTH_MM = 6;       // grayscale 255 -> 6 mm physical depth
+// Grayscale 255 ↔ this many mm of physical depth. Recomputed per render based
+// on the user's max depth setting so the peak stroke uses the full grayscale
+// range (best resolution for the V-profile gradient).
+let maxDepthMm = 6;
 const CANVAS_RES = 1000;      // long side of depth canvas in pixels
-const PLANE_SEG_PER_MM = 1;   // PlaneGeometry segment density (1 vertex per mm)
-const PLANE_SEG_CAP = 500;    // cap per axis to keep buffer size sane
+// Front-face vertex grid: target 1 vertex per mm so it matches the depth-canvas
+// resolution. Cap prevents huge cells (>1m) from blowing up the buffer.
+const PLANE_SEG_PER_MM = 1;
+const PLANE_SEG_CAP = 1000;
 
 // === Seeded PRNG (mulberry32) ===
 function hashToSeed(hash) {
@@ -142,57 +146,130 @@ function init() {
     animate();
 }
 
+// Returns true if a panel-coord point is inside the carving region (panel
+// minus frame margins). Optional halfW shrinks the boundary so the round
+// stroke cap with that half-width still fits entirely inside the frame —
+// this is what mirrors a real V-bit lifting before reaching the rim.
+function inFrameRegion(x, y, panelW, panelH, frame, halfW) {
+    const m = halfW || 0;
+    const left = -panelW / 2 + (frame.left || 0) + m;
+    const right = panelW / 2 - (frame.right || 0) - m;
+    const bottom = -panelH / 2 + (frame.bottom || 0) + m;
+    const top = panelH / 2 - (frame.top || 0) - m;
+    if (left > right || bottom > top) return false;
+    return x >= left && x <= right && y >= bottom && y <= top;
+}
+
 // === Stroke generation ===
 function generateStrokes(panelW, panelH, params, rng) {
-    const { strokeWidthMm, densityPerArea, placement, pattern, strokeLength, scaleFreq, layers } = params;
+    const {
+        minDepthMm, maxDepthMm: maxD, maxRatio, varyAlongStroke,
+        densityPerArea, placement, pattern, strokeLength, scaleFreq, layers, frame,
+    } = params;
+    // Width is derived from depth per V-bit physics: depth = w * tan(angle)/2 = w * maxRatio
+    // → w = depth / maxRatio
+    const avgDepth = (minDepthMm + maxD) / 2;
+    const avgWidthMm = avgDepth / Math.max(0.001, maxRatio);
+
     const area = (panelW * panelH) / 10000; // in 100x100mm units
     const strokesPerLayer = Math.max(2, Math.round(densityPerArea * area));
-    const strokeStepMm = Math.max(0.5, strokeWidthMm * 0.5);
+    const strokeStepMm = Math.max(0.5, avgWidthMm * 0.5);
     const strokeMaxLength = Math.min(panelW, panelH) * 0.8;
 
     const simplexInst = new SimplexNoise(rng);
+    // Independent noise instance for along-stroke depth modulation, so the
+    // depth pattern is decorrelated from the flow direction.
+    const depthSimplex = new SimplexNoise(() => rng());
 
     const lengthMul = strokeLength === 'short' ? 0.45 :
                       strokeLength === 'long' ? 3.5 : 1.0;
     const traceBoth = strokeLength === 'long';
-    const margin = 8; // mm — strokes may briefly exit the panel and curl back
+
+    // Use the maximum possible half-width as the frame margin so the round
+    // line cap of even the deepest stroke stays inside the frame.
+    const frameMargin = (maxD / Math.max(0.001, maxRatio)) / 2;
 
     const strokes = [];
     for (let layer = 0; layer < layers; layer++) {
         for (let i = 0; i < strokesPerLayer; i++) {
-            const seedPt = pickSeedPoint(placement, panelW, panelH, i, strokesPerLayer, densityPerArea, rng);
+            // Retry seed if it lands outside the frame region; gives up after
+            // a few attempts to avoid infinite loops with a thick frame.
+            let seedPt = null;
+            for (let attempt = 0; attempt < 6; attempt++) {
+                const candidate = pickSeedPoint(placement, panelW, panelH, i, strokesPerLayer, densityPerArea, rng);
+                if (inFrameRegion(candidate.x, candidate.y, panelW, panelH, frame, frameMargin)) {
+                    seedPt = candidate;
+                    break;
+                }
+            }
+            if (!seedPt) continue;
             const lengthFactor = strokeLengthFactor(placement) * lengthMul;
             const maxSteps = Math.floor((strokeMaxLength * lengthFactor) / strokeStepMm);
             const stepCount = Math.max(6, Math.floor(maxSteps * (0.5 + rng() * 0.5)));
-            const baseWidth = strokeWidthMm * (0.85 + rng() * 0.3);
+
+            // Per-stroke base depth: random in [min, max]. Used directly when not
+            // varying along the stroke; otherwise serves as the noise's mean.
+            const baseDepth = minDepthMm + rng() * (maxD - minDepthMm);
+            // Seed offset to decorrelate per-stroke noise patterns
+            const depthSeed = rng() * 1000;
+            const depthFreq = 0.04; // along-stroke wavelength in mm⁻¹
 
             const points = [];
+            let accumDist = 0;
+            const lastPt = { x: 0, y: 0, set: false };
 
-            // Forward trace from seed
+            const computeWidth = (x, y) => {
+                let depth;
+                if (varyAlongStroke) {
+                    if (lastPt.set) accumDist += Math.hypot(x - lastPt.x, y - lastPt.y);
+                    lastPt.x = x; lastPt.y = y; lastPt.set = true;
+                    const n = depthSimplex.noise2D(accumDist * depthFreq, depthSeed);
+                    const t = (n + 1) * 0.5; // 0..1
+                    depth = minDepthMm + t * (maxD - minDepthMm);
+                } else {
+                    depth = baseDepth;
+                }
+                return { depth, w: depth / Math.max(0.001, maxRatio) };
+            };
+
+            // Forward trace — terminate when leaving frame region (with the
+            // current point's half-width as margin so the round cap fits).
             let fx = seedPt.x, fy = seedPt.y;
             for (let s = 0; s < stepCount; s++) {
                 if (!inPlacementRegion(placement, fx, fy, panelW, panelH)) break;
-                if (fx < -panelW / 2 - margin || fx > panelW / 2 + margin ||
-                    fy < -panelH / 2 - margin || fy > panelH / 2 + margin) break;
-                points.push({ x: fx, y: fy, w: baseWidth });
+                const cw = computeWidth(fx, fy);
+                if (!inFrameRegion(fx, fy, panelW, panelH, frame, cw.w / 2)) break;
+                points.push({ x: fx, y: fy, w: cw.w, depth: cw.depth });
                 const ang = patternFlowAngle(pattern, fx, fy, simplexInst, scaleFreq, panelW, panelH);
                 fx += Math.cos(ang) * strokeStepMm;
                 fy += Math.sin(ang) * strokeStepMm;
             }
 
-            // Backward trace from seed (only when "long") — extends the stroke
-            // to the opposite panel edge so a single line spans the full panel.
+            // Backward trace from seed (only when "long")
             if (traceBoth) {
                 const backward = [];
                 let bx = seedPt.x, by = seedPt.y;
+                // Reset the along-distance walker for backward chain — it
+                // continues from the seed outward, just like forward did.
+                lastPt.set = false;
+                let backAccum = 0;
                 for (let s = 0; s < stepCount; s++) {
                     const ang = patternFlowAngle(pattern, bx, by, simplexInst, scaleFreq, panelW, panelH);
                     bx -= Math.cos(ang) * strokeStepMm;
                     by -= Math.sin(ang) * strokeStepMm;
                     if (!inPlacementRegion(placement, bx, by, panelW, panelH)) break;
-                    if (bx < -panelW / 2 - margin || bx > panelW / 2 + margin ||
-                        by < -panelH / 2 - margin || by > panelH / 2 + margin) break;
-                    backward.push({ x: bx, y: by, w: baseWidth });
+                    let depth;
+                    if (varyAlongStroke) {
+                        backAccum += strokeStepMm;
+                        const n = depthSimplex.noise2D(-backAccum * depthFreq, depthSeed);
+                        const t = (n + 1) * 0.5;
+                        depth = minDepthMm + t * (maxD - minDepthMm);
+                    } else {
+                        depth = baseDepth;
+                    }
+                    const wm = depth / Math.max(0.001, maxRatio);
+                    if (!inFrameRegion(bx, by, panelW, panelH, frame, wm / 2)) break;
+                    backward.push({ x: bx, y: by, w: wm, depth });
                 }
                 if (backward.length > 0) {
                     backward.reverse();
@@ -200,7 +277,10 @@ function generateStrokes(panelW, panelH, params, rng) {
                 }
             }
 
-            if (points.length >= 2) strokes.push(points);
+            if (points.length >= 2) {
+                points.uniform = !varyAlongStroke;
+                strokes.push(points);
+            }
         }
     }
     return strokes;
@@ -393,31 +473,57 @@ function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
 
     for (const stroke of strokes) {
         if (!stroke || stroke.length < 2) continue;
-        let strokeWmm = 0;
-        for (const pt of stroke) if (pt.w > strokeWmm) strokeWmm = pt.w;
-        if (strokeWmm < 0.05) continue;
 
-        const peakDepthMm = strokeWmm * maxRatio;
-        const peakG = Math.min(255, Math.round((peakDepthMm / MAX_DEPTH_MM) * 255));
-        if (peakG < 1) continue;
+        if (stroke.uniform) {
+            // Fast path: one polyline per layer, single lineWidth.
+            const strokeWmm = stroke[0].w;
+            if (strokeWmm < 0.05) continue;
+            const peakDepthMm = strokeWmm * maxRatio;
+            const peakG = Math.min(255, Math.round((peakDepthMm / maxDepthMm) * 255));
+            if (peakG < 1) continue;
 
-        // Pre-build the path for this stroke; reuse across layer passes.
-        ctx.beginPath();
-        ctx.moveTo(px(stroke[0].x), py(stroke[0].y));
-        for (let i = 1; i < stroke.length; i++) {
-            ctx.lineTo(px(stroke[i].x), py(stroke[i].y));
-        }
+            ctx.beginPath();
+            ctx.moveTo(px(stroke[0].x), py(stroke[0].y));
+            for (let i = 1; i < stroke.length; i++) {
+                ctx.lineTo(px(stroke[i].x), py(stroke[i].y));
+            }
+            for (let k = 1; k <= PROFILE_LAYERS; k++) {
+                const widthFrac = 1 - (k - 1) / PROFILE_LAYERS;
+                const widthMm = strokeWmm * widthFrac;
+                if (widthMm < 0.04) break;
+                const gray = Math.round(peakG * (2 * k - 1) / (2 * PROFILE_LAYERS));
+                if (gray < 1) continue;
+                ctx.strokeStyle = `rgb(${gray},${gray},${gray})`;
+                ctx.lineWidth = Math.max(0.5, widthMm * mmToPx);
+                ctx.stroke();
+            }
+        } else {
+            // Variable width along stroke: per-segment passes. Round caps on
+            // every segment overlap their neighbours so width transitions are
+            // smooth and seam-free.
+            for (let i = 0; i < stroke.length - 1; i++) {
+                const a = stroke[i];
+                const b = stroke[i + 1];
+                const segW = (a.w + b.w) / 2;
+                if (segW < 0.05) continue;
+                const peakDepthMm = segW * maxRatio;
+                const peakG = Math.min(255, Math.round((peakDepthMm / maxDepthMm) * 255));
+                if (peakG < 1) continue;
 
-        for (let k = 1; k <= PROFILE_LAYERS; k++) {
-            const widthFrac = 1 - (k - 1) / PROFILE_LAYERS;
-            const widthMm = strokeWmm * widthFrac;
-            if (widthMm < 0.04) break;
-            // Mid-of-ring depth as fraction of peak
-            const gray = Math.round(peakG * (2 * k - 1) / (2 * PROFILE_LAYERS));
-            if (gray < 1) continue;
-            ctx.strokeStyle = `rgb(${gray},${gray},${gray})`;
-            ctx.lineWidth = Math.max(0.5, widthMm * mmToPx);
-            ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(px(a.x), py(a.y));
+                ctx.lineTo(px(b.x), py(b.y));
+                for (let k = 1; k <= PROFILE_LAYERS; k++) {
+                    const widthFrac = 1 - (k - 1) / PROFILE_LAYERS;
+                    const widthMm = segW * widthFrac;
+                    if (widthMm < 0.04) break;
+                    const gray = Math.round(peakG * (2 * k - 1) / (2 * PROFILE_LAYERS));
+                    if (gray < 1) continue;
+                    ctx.strokeStyle = `rgb(${gray},${gray},${gray})`;
+                    ctx.lineWidth = Math.max(0.5, widthMm * mmToPx);
+                    ctx.stroke();
+                }
+            }
         }
     }
 
@@ -434,15 +540,9 @@ function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
         ctx.drawImage(tmp, 0, 0);
     }
 
-    if (frame === 'thick') {
-        const margin = Math.round(Math.min(cw, ch) * 0.06);
-        ctx.globalCompositeOperation = 'source-over';
-        ctx.fillStyle = '#000';
-        ctx.fillRect(0, 0, cw, margin);
-        ctx.fillRect(0, ch - margin, cw, margin);
-        ctx.fillRect(0, 0, margin, ch);
-        ctx.fillRect(cw - margin, 0, margin, ch);
-    }
+    // Frame is enforced during stroke tracing now (strokes terminate inside
+    // the frame margin so their round caps stay within the rim), so no
+    // post-render mask is needed here.
 
     ctx.globalCompositeOperation = 'source-over';
 }
@@ -453,7 +553,7 @@ function sampleDepth(imageData, cw, ch, panelW, panelH, panelX, panelY) {
     const py = Math.floor(ch - (panelY + panelH / 2) / panelH * ch);
     if (px < 0 || px >= cw || py < 0 || py >= ch) return 0;
     const idx = (py * cw + px) * 4;
-    return (imageData[idx] / 255) * MAX_DEPTH_MM;
+    return (imageData[idx] / 255) * maxDepthMm;
 }
 
 // === createPanel: full pipeline ===
@@ -477,25 +577,36 @@ function createPanel() {
     const pattern = patternEl ? patternEl.value : 'flow';
     const strokeLengthEl = document.getElementById('strokeLength');
     const strokeLength = strokeLengthEl ? strokeLengthEl.value : 'normal';
-    const thicknessLevel = parseInt(document.getElementById('strokeThickness').value);
+    const minDepth = Math.max(0.5, parseFloat(document.getElementById('minDepth').value) || 4);
+    const maxDepth = Math.max(minDepth, parseFloat(document.getElementById('maxDepth').value) || 6);
+    const varyAlongStroke = !!document.getElementById('varyAlongStroke').checked;
     const densityLevel = parseInt(document.getElementById('density').value);
     const scaleKey = document.getElementById('patternScale').value;
     const layers = parseInt(document.getElementById('layers').value);
-    const frame = document.getElementById('frame').value;
+    const frame = {
+        top:    Math.max(0, parseFloat(document.getElementById('frameTop').value)    || 0),
+        right:  Math.max(0, parseFloat(document.getElementById('frameRight').value)  || 0),
+        bottom: Math.max(0, parseFloat(document.getElementById('frameBottom').value) || 0),
+        left:   Math.max(0, parseFloat(document.getElementById('frameLeft').value)   || 0),
+    };
     const hash = document.getElementById('hash').value;
 
-    const strokeWidthMm = THICKNESS_MM[thicknessLevel];
     const densityPerArea = DENSITY_PER_AREA[densityLevel];
     const scaleFreq = SCALE_FREQ[scaleKey];
+    const maxRatio = vBitMaxDepthRatio(bit);
+    // Map grayscale 255 to the user's max depth so the V-profile gradient uses
+    // the full grayscale range — best resolution per stroke.
+    maxDepthMm = Math.max(maxDepth, 1);
 
     const seed = hashToSeed(hash);
     const rng = mulberry32(seed);
 
     const strokes = generateStrokes(panelW, panelH, {
-        strokeWidthMm, densityPerArea, placement, pattern, strokeLength, scaleFreq, layers,
+        minDepthMm: minDepth, maxDepthMm: maxDepth, maxRatio, varyAlongStroke,
+        densityPerArea, placement, pattern, strokeLength, scaleFreq, layers, frame,
     }, rng);
 
-    renderDepthCanvas(panelW, panelH, strokes, bit, frame);
+    renderDepthCanvas(panelW, panelH, strokes, bit, null);
     const cw = depthCanvas.width;
     const ch = depthCanvas.height;
     const imageData = depthCtx.getImageData(0, 0, cw, ch).data;

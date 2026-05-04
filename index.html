@@ -95,15 +95,9 @@
                     <option value="long">Long (rand-tot-rand)</option>
                 </select>
             </label>
-            <label>Thickness:
-                <select id="strokeThickness" onchange="updatePanel()">
-                    <option value="1">Fine</option>
-                    <option value="2">Thin</option>
-                    <option value="3" selected>Medium</option>
-                    <option value="4">Thick</option>
-                    <option value="5">Chunky</option>
-                </select>
-            </label>
+            <label>Min diepte (mm): <input type="number" id="minDepth" value="4" min="0.5" max="20" step="0.5" onchange="updatePanel()"></label>
+            <label>Max diepte (mm): <input type="number" id="maxDepth" value="6" min="0.5" max="20" step="0.5" onchange="updatePanel()"></label>
+            <label><input type="checkbox" id="varyAlongStroke" onchange="updatePanel()"> Diepte varieert langs lijn</label>
             <label>Density:
                 <select id="density" onchange="updatePanel()">
                     <option value="1">Sparse</option>
@@ -127,12 +121,10 @@
                     <option value="8">Many</option>
                 </select>
             </label>
-            <label>Frame:
-                <select id="frame" onchange="updatePanel()">
-                    <option value="none" selected>None</option>
-                    <option value="thick">Thick</option>
-                </select>
-            </label>
+            <label>Frame top (mm): <input type="number" id="frameTop" value="0" min="0" max="500" step="1" onchange="updatePanel()"></label>
+            <label>Frame right (mm): <input type="number" id="frameRight" value="0" min="0" max="500" step="1" onchange="updatePanel()"></label>
+            <label>Frame bottom (mm): <input type="number" id="frameBottom" value="0" min="0" max="500" step="1" onchange="updatePanel()"></label>
+            <label>Frame left (mm): <input type="number" id="frameLeft" value="0" min="0" max="500" step="1" onchange="updatePanel()"></label>
         </div>
 
         <div class="step" id="step4-export">
