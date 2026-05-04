@@ -151,7 +151,6 @@ function generateStrokes(panelW, panelH, params, rng) {
     const strokeMaxLength = Math.min(panelW, panelH) * 0.8;
 
     const simplexInst = new SimplexNoise(rng);
-    const flow = (x, y) => simplexInst.noise2D(x * scaleFreq, y * scaleFreq) * Math.PI * 2;
 
     const strokes = [];
     for (let layer = 0; layer < layers; layer++) {
@@ -160,25 +159,97 @@ function generateStrokes(panelW, panelH, params, rng) {
             let x = seedPt.x;
             let y = seedPt.y;
 
+            // Strokes that need locality (rows/columns) trace shorter paths so the
+            // band/column structure stays visible.
+            const lengthFactor = strokeLengthFactor(placement);
             const points = [];
-            const maxSteps = Math.floor(strokeMaxLength / strokeStepMm);
+            const maxSteps = Math.floor((strokeMaxLength * lengthFactor) / strokeStepMm);
             const stepCount = Math.max(6, Math.floor(maxSteps * (0.4 + rng() * 0.6)));
             const baseWidth = strokeWidthMm * (0.85 + rng() * 0.3);
 
             for (let s = 0; s < stepCount; s++) {
+                if (!inPlacementRegion(placement, x, y, panelW, panelH)) break;
                 points.push({ x, y, w: baseWidth });
-                const ang = flow(x, y);
+                const ang = flowAngle(placement, x, y, simplexInst, scaleFreq, panelW, panelH);
                 x += Math.cos(ang) * strokeStepMm;
                 y += Math.sin(ang) * strokeStepMm;
                 if (x < -panelW / 2 - 20 || x > panelW / 2 + 20 ||
                     y < -panelH / 2 - 20 || y > panelH / 2 + 20) break;
             }
-            // Uniform width along stroke; round line caps provide smooth ends
-            // matching how a real V-bit plunges/lifts.
-            strokes.push(points);
+            if (points.length >= 2) strokes.push(points);
         }
     }
     return strokes;
+}
+
+// Per-placement flow angle. Rows/columns lock to one axis with mild noise wander;
+// cross switches axis depending on which arm we're in; chaos/grid use full noise.
+function flowAngle(placement, x, y, simplexInst, scaleFreq, panelW, panelH) {
+    const n = simplexInst.noise2D(x * scaleFreq, y * scaleFreq);
+    switch (placement) {
+        case 'rows':
+            return n * 0.5; // mostly horizontal, ±~28°
+        case 'columns':
+            return Math.PI / 2 + n * 0.5; // mostly vertical
+        case 'cross': {
+            const inH = Math.abs(y) < panelH * 0.22;
+            const inV = Math.abs(x) < panelW * 0.22;
+            if (inH && !inV) return n * 0.5;
+            if (inV && !inH) return Math.PI / 2 + n * 0.5;
+            return n * Math.PI * 2;
+        }
+        case 'grid':
+            return n * Math.PI * 2;
+        default:
+            return n * Math.PI * 2;
+    }
+}
+
+// Region containment per placement. Cross/square/diamonds confine strokes so
+// out-of-region areas stay clean MDF.
+function inPlacementRegion(placement, x, y, W, H) {
+    switch (placement) {
+        case 'cross': {
+            const inH = Math.abs(y) < H * 0.25;
+            const inV = Math.abs(x) < W * 0.25;
+            return inH || inV;
+        }
+        case 'square': {
+            // Four square clusters with empty gutters between them
+            const ax = Math.abs(x), ay = Math.abs(y);
+            return ax > W * 0.06 && ax < W * 0.46 && ay > H * 0.06 && ay < H * 0.46;
+        }
+        case 'diamonds': {
+            const centers = [
+                [0, 0],
+                [W * 0.32, H * 0.32],
+                [-W * 0.32, H * 0.32],
+                [W * 0.32, -H * 0.32],
+                [-W * 0.32, -H * 0.32],
+            ];
+            const r = Math.min(W, H) * 0.18;
+            for (let k = 0; k < centers.length; k++) {
+                const dx = x - centers[k][0];
+                const dy = y - centers[k][1];
+                if (Math.abs(dx) / r + Math.abs(dy) / r < 1) return true;
+            }
+            return false;
+        }
+        default:
+            return true;
+    }
+}
+
+function strokeLengthFactor(placement) {
+    switch (placement) {
+        case 'grid':    return 0.45;
+        case 'rows':    return 0.55;
+        case 'columns': return 0.55;
+        case 'square':  return 0.55;
+        case 'diamonds': return 0.55;
+        case 'cross':   return 0.75;
+        default:        return 1.0; // chaos
+    }
 }
 
 function pickSeedPoint(placement, W, H, i, total, density, rng) {
@@ -193,35 +264,51 @@ function pickSeedPoint(placement, W, H, i, total, density, rng) {
             return { x: sx, y: sy };
         }
         case 'rows': {
-            const numRows = Math.max(3, Math.round(density * H / 60));
+            const numRows = Math.max(4, Math.round(density * H / 50));
             const ri = i % numRows;
-            const sy = -H / 2 + (ri + 0.5) * H / numRows + (rng() - 0.5) * 4;
+            const rowH = H / numRows;
+            const sy = -H / 2 + (ri + 0.5) * rowH + (rng() - 0.5) * rowH * 0.3;
             return { x: -W / 2 + rng() * W, y: sy };
         }
         case 'columns': {
-            const numCols = Math.max(3, Math.round(density * W / 60));
+            const numCols = Math.max(4, Math.round(density * W / 50));
             const ci = i % numCols;
-            const sx = -W / 2 + (ci + 0.5) * W / numCols + (rng() - 0.5) * 4;
+            const colW = W / numCols;
+            const sx = -W / 2 + (ci + 0.5) * colW + (rng() - 0.5) * colW * 0.3;
             return { x: sx, y: -H / 2 + rng() * H };
         }
         case 'cross': {
+            // 50/50 between horizontal arm and vertical arm
             if (rng() < 0.5) {
-                return { x: -W / 2 + rng() * W, y: (rng() - 0.5) * H * 0.18 };
+                return { x: -W / 2 + rng() * W, y: (rng() - 0.5) * H * 0.4 };
             }
-            return { x: (rng() - 0.5) * W * 0.18, y: -H / 2 + rng() * H };
-        }
-        case 'diamonds': {
-            const cx = (rng() < 0.5 ? -1 : 1) * W * 0.3 * rng();
-            const cy = (rng() < 0.5 ? -1 : 1) * H * 0.3 * rng();
-            const ang = rng() * Math.PI * 2;
-            const r = rng() * Math.min(W, H) * 0.18;
-            return { x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r };
+            return { x: (rng() - 0.5) * W * 0.4, y: -H / 2 + rng() * H };
         }
         case 'square': {
+            // Pick one of 4 quadrant clusters
             const block = Math.floor(rng() * 4);
-            const bx = (block % 2) * W * 0.5 - W * 0.25;
-            const by = Math.floor(block / 2) * H * 0.5 - H * 0.25;
-            return { x: bx + (rng() - 0.5) * W * 0.4, y: by + (rng() - 0.5) * H * 0.4 };
+            const sx = (block % 2 === 0 ? -1 : 1) * W * 0.26;
+            const sy = (block < 2 ? -1 : 1) * H * 0.26;
+            return { x: sx + (rng() - 0.5) * W * 0.32, y: sy + (rng() - 0.5) * H * 0.32 };
+        }
+        case 'diamonds': {
+            const centers = [
+                [0, 0],
+                [W * 0.32, H * 0.32],
+                [-W * 0.32, H * 0.32],
+                [W * 0.32, -H * 0.32],
+                [-W * 0.32, -H * 0.32],
+            ];
+            const ci = Math.floor(rng() * centers.length);
+            const [cx, cy] = centers[ci];
+            const r = Math.min(W, H) * 0.18;
+            // Rejection-sample inside the diamond |dx/r|+|dy/r| < 1
+            for (let attempt = 0; attempt < 8; attempt++) {
+                const dx = (rng() - 0.5) * 2 * r;
+                const dy = (rng() - 0.5) * 2 * r;
+                if (Math.abs(dx) / r + Math.abs(dy) / r < 1) return { x: cx + dx, y: cy + dy };
+            }
+            return { x: cx, y: cy };
         }
         case 'chaos':
         default:
