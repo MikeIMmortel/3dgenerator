@@ -144,7 +144,7 @@ function init() {
 
 // === Stroke generation ===
 function generateStrokes(panelW, panelH, params, rng) {
-    const { strokeWidthMm, densityPerArea, placement, scaleFreq, layers } = params;
+    const { strokeWidthMm, densityPerArea, placement, pattern, scaleFreq, layers } = params;
     const area = (panelW * panelH) / 10000; // in 100x100mm units
     const strokesPerLayer = Math.max(2, Math.round(densityPerArea * area));
     const strokeStepMm = Math.max(0.5, strokeWidthMm * 0.5);
@@ -159,8 +159,6 @@ function generateStrokes(panelW, panelH, params, rng) {
             let x = seedPt.x;
             let y = seedPt.y;
 
-            // Strokes that need locality (rows/columns) trace shorter paths so the
-            // band/column structure stays visible.
             const lengthFactor = strokeLengthFactor(placement);
             const points = [];
             const maxSteps = Math.floor((strokeMaxLength * lengthFactor) / strokeStepMm);
@@ -170,7 +168,7 @@ function generateStrokes(panelW, panelH, params, rng) {
             for (let s = 0; s < stepCount; s++) {
                 if (!inPlacementRegion(placement, x, y, panelW, panelH)) break;
                 points.push({ x, y, w: baseWidth });
-                const ang = flowAngle(placement, x, y, simplexInst, scaleFreq, panelW, panelH);
+                const ang = patternFlowAngle(pattern, x, y, simplexInst, scaleFreq, panelW, panelH);
                 x += Math.cos(ang) * strokeStepMm;
                 y += Math.sin(ang) * strokeStepMm;
                 if (x < -panelW / 2 - 20 || x > panelW / 2 + 20 ||
@@ -182,24 +180,44 @@ function generateStrokes(panelW, panelH, params, rng) {
     return strokes;
 }
 
-// Per-placement flow angle. Rows/columns lock to one axis with mild noise wander;
-// cross switches axis depending on which arm we're in; chaos/grid use full noise.
-function flowAngle(placement, x, y, simplexInst, scaleFreq, panelW, panelH) {
+// Pattern controls the FLOW direction of strokes — independent of placement.
+// Placement decides where strokes start and which regions they're allowed in;
+// pattern decides which way they travel from there.
+function patternFlowAngle(pattern, x, y, simplexInst, scaleFreq, panelW, panelH) {
     const n = simplexInst.noise2D(x * scaleFreq, y * scaleFreq);
-    switch (placement) {
-        case 'rows':
-            return n * 0.5; // mostly horizontal, ±~28°
-        case 'columns':
-            return Math.PI / 2 + n * 0.5; // mostly vertical
-        case 'cross': {
+    switch (pattern) {
+        case 'horizontal':
+            return n * 0.18; // ±~10° wobble around horizontal
+        case 'vertical':
+            return Math.PI / 2 + n * 0.18;
+        case 'diagonal':
+            return Math.PI / 4 + n * 0.18;
+        case 'wavy': {
+            // Sine wave running along x; angle oscillates around horizontal.
+            const wave = Math.sin(x * scaleFreq * 6) * 0.7;
+            return wave + n * 0.12;
+        }
+        case 'concentric': {
+            // Tangent to the radius vector → strokes form rings around panel centre.
+            return Math.atan2(y, x) + Math.PI / 2 + n * 0.08;
+        }
+        case 'radial': {
+            // Along the radius vector → strokes emanate from / into the centre.
+            return Math.atan2(y, x) + n * 0.08;
+        }
+        case 'spiral': {
+            // Tangent with a slight inward bias so strokes spiral.
+            return Math.atan2(y, x) + Math.PI / 2 - 0.35 + n * 0.08;
+        }
+        case 'cross-axis': {
+            // Horizontal in horizontal cross-arm, vertical in vertical arm.
             const inH = Math.abs(y) < panelH * 0.22;
             const inV = Math.abs(x) < panelW * 0.22;
-            if (inH && !inV) return n * 0.5;
-            if (inV && !inH) return Math.PI / 2 + n * 0.5;
+            if (inH && !inV) return n * 0.4;
+            if (inV && !inH) return Math.PI / 2 + n * 0.4;
             return n * Math.PI * 2;
         }
-        case 'grid':
-            return n * Math.PI * 2;
+        case 'flow':
         default:
             return n * Math.PI * 2;
     }
@@ -428,6 +446,8 @@ function createPanel() {
     const ralHex = getRALHex(ralCode);
     const bit = document.getElementById('bit').value;
     const placement = document.getElementById('placement').value;
+    const patternEl = document.getElementById('pattern');
+    const pattern = patternEl ? patternEl.value : 'flow';
     const thicknessLevel = parseInt(document.getElementById('strokeThickness').value);
     const densityLevel = parseInt(document.getElementById('density').value);
     const scaleKey = document.getElementById('patternScale').value;
@@ -443,7 +463,7 @@ function createPanel() {
     const rng = mulberry32(seed);
 
     const strokes = generateStrokes(panelW, panelH, {
-        strokeWidthMm, densityPerArea, placement, scaleFreq, layers,
+        strokeWidthMm, densityPerArea, placement, pattern, scaleFreq, layers,
     }, rng);
 
     renderDepthCanvas(panelW, panelH, strokes, bit, frame);

@@ -66,13 +66,26 @@
             </label>
             <label>Placement:
                 <select id="placement" onchange="updatePanel()">
-                    <option value="chaos" selected>Chaos</option>
+                    <option value="chaos" selected>Chaos (overal)</option>
                     <option value="grid">Grid</option>
                     <option value="rows">Rows</option>
                     <option value="columns">Columns</option>
                     <option value="cross">Cross</option>
                     <option value="diamonds">Diamonds</option>
                     <option value="square">Square</option>
+                </select>
+            </label>
+            <label>Pattern:
+                <select id="pattern" onchange="updatePanel()">
+                    <option value="flow" selected>Flow (chaos)</option>
+                    <option value="horizontal">Horizontaal</option>
+                    <option value="vertical">Verticaal</option>
+                    <option value="diagonal">Diagonaal</option>
+                    <option value="wavy">Wavy</option>
+                    <option value="concentric">Concentrisch</option>
+                    <option value="radial">Radiaal</option>
+                    <option value="spiral">Spiraal</option>
+                    <option value="cross-axis">Cross-gemixt</option>
                 </select>
             </label>
             <label>Thickness:
