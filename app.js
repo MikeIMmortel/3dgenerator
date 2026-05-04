@@ -173,15 +173,8 @@ function generateStrokes(panelW, panelH, params, rng) {
                 if (x < -panelW / 2 - 20 || x > panelW / 2 + 20 ||
                     y < -panelH / 2 - 20 || y > panelH / 2 + 20) break;
             }
-
-            // Taper start/end so strokes don't end abruptly
-            const taperLen = Math.max(2, Math.floor(points.length * 0.15));
-            for (let s = 0; s < points.length; s++) {
-                let factor = 1;
-                if (s < taperLen) factor = s / taperLen;
-                else if (s > points.length - taperLen) factor = (points.length - s) / taperLen;
-                points[s].w *= factor;
-            }
+            // Uniform width along stroke; round line caps provide smooth ends
+            // matching how a real V-bit plunges/lifts.
             strokes.push(points);
         }
     }
@@ -237,6 +230,13 @@ function pickSeedPoint(placement, W, H, i, total, density, rng) {
 }
 
 // === Depth canvas rendering ===
+// Each stroke is rasterised as ~PROFILE_LAYERS stacked polyline passes, going
+// from full-width-darkest to centerline-brightest. lineCap/lineJoin = 'round'
+// keeps the polyline smooth across direction changes — no per-segment seams.
+// 'lighten' composite ensures the deepest value wins both within a stroke
+// (concentric passes) and between overlapping strokes.
+const PROFILE_LAYERS = 22;
+
 function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
     const long = Math.max(panelW, panelH);
     const cw = Math.round(CANVAS_RES * (panelW / long));
@@ -249,8 +249,9 @@ function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, cw, ch);
     ctx.globalCompositeOperation = 'lighten';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
 
-    const profile = vBitProfile(bit);
     const maxRatio = vBitMaxDepthRatio(bit);
     const mmToPx = cw / panelW;
 
@@ -258,51 +259,32 @@ function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
     const py = (my) => ch - (my + panelH / 2) * (ch / panelH);
 
     for (const stroke of strokes) {
-        if (stroke.length < 2) continue;
-        for (let i = 0; i < stroke.length - 1; i++) {
-            const a = stroke[i];
-            const b = stroke[i + 1];
-            if (a.w < 0.05 && b.w < 0.05) continue;
+        if (!stroke || stroke.length < 2) continue;
+        let strokeWmm = 0;
+        for (const pt of stroke) if (pt.w > strokeWmm) strokeWmm = pt.w;
+        if (strokeWmm < 0.05) continue;
 
-            const ax = px(a.x), ay = py(a.y);
-            const bx = px(b.x), by = py(b.y);
-            const sdx = bx - ax, sdy = by - ay;
-            const len = Math.hypot(sdx, sdy);
-            if (len < 0.01) continue;
-            const nx = -sdy / len, ny = sdx / len;
-            const aHalf = (a.w / 2) * mmToPx;
-            const bHalf = (b.w / 2) * mmToPx;
-            const halfMax = Math.max(aHalf, bHalf, 1);
+        const peakDepthMm = strokeWmm * maxRatio;
+        const peakG = Math.min(255, Math.round((peakDepthMm / MAX_DEPTH_MM) * 255));
+        if (peakG < 1) continue;
 
-            const p0x = ax + nx * aHalf, p0y = ay + ny * aHalf;
-            const p1x = bx + nx * bHalf, p1y = by + ny * bHalf;
-            const p2x = bx - nx * bHalf, p2y = by - ny * bHalf;
-            const p3x = ax - nx * aHalf, p3y = ay - ny * aHalf;
+        // Pre-build the path for this stroke; reuse across layer passes.
+        ctx.beginPath();
+        ctx.moveTo(px(stroke[0].x), py(stroke[0].y));
+        for (let i = 1; i < stroke.length; i++) {
+            ctx.lineTo(px(stroke[i].x), py(stroke[i].y));
+        }
 
-            // Midpoint of the segment for the gradient axis
-            const midX = (ax + bx) / 2;
-            const midY = (ay + by) / 2;
-            const grad = ctx.createLinearGradient(
-                midX + nx * halfMax, midY + ny * halfMax,
-                midX - nx * halfMax, midY - ny * halfMax
-            );
-            const peakDepthMm = ((a.w + b.w) / 2) * maxRatio;
-            const peakG = Math.min(255, Math.round((peakDepthMm / MAX_DEPTH_MM) * 255));
-            const samples = 9;
-            for (let s = 0; s < samples; s++) {
-                const t = s / (samples - 1);
-                const profileFrac = profile(t) / maxRatio; // 0..1
-                const g = Math.round(profileFrac * peakG);
-                grad.addColorStop(t, `rgb(${g},${g},${g})`);
-            }
-            ctx.fillStyle = grad;
-            ctx.beginPath();
-            ctx.moveTo(p0x, p0y);
-            ctx.lineTo(p1x, p1y);
-            ctx.lineTo(p2x, p2y);
-            ctx.lineTo(p3x, p3y);
-            ctx.closePath();
-            ctx.fill();
+        for (let k = 1; k <= PROFILE_LAYERS; k++) {
+            const widthFrac = 1 - (k - 1) / PROFILE_LAYERS;
+            const widthMm = strokeWmm * widthFrac;
+            if (widthMm < 0.04) break;
+            // Mid-of-ring depth as fraction of peak
+            const gray = Math.round(peakG * (2 * k - 1) / (2 * PROFILE_LAYERS));
+            if (gray < 1) continue;
+            ctx.strokeStyle = `rgb(${gray},${gray},${gray})`;
+            ctx.lineWidth = Math.max(0.5, widthMm * mmToPx);
+            ctx.stroke();
         }
     }
 
