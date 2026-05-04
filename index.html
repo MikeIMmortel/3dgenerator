@@ -3,110 +3,135 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D Panel Designer</title>
+    <title>MDF V-Frees Generator</title>
     <style>
-        body { margin: 0; }
-        #scene-container { width: 100%; height: calc(100vh - 50px); }
-        #controls { position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.7); padding: 10px; width: 300px; }
-        .step { margin-bottom: 20px; }
-        .step h3 { margin-top: 0; }
-        .button-container { position: absolute; top: 10px; left: 350px; }
-        .column-section, .row-section { margin-bottom: 10px; }
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        #scene-container { width: 100%; height: 100vh; }
+        #controls {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(255,255,255,0.92); padding: 14px;
+            width: 280px; border-radius: 6px; box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+            font-size: 13px; max-height: calc(100vh - 30px); overflow-y: auto;
+        }
+        .step { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #eee; }
+        .step:last-child { border-bottom: none; }
+        .step h3 { margin: 0 0 8px 0; font-size: 14px; }
+        label { display: block; margin: 4px 0; }
+        input[type="number"], input[type="text"], select { width: 130px; }
+        input[type="range"] { width: 130px; vertical-align: middle; }
+        .button-container { position: absolute; top: 10px; right: 10px; display: flex; gap: 6px; }
+        .button-container button { padding: 8px 14px; font-size: 13px; cursor: pointer; }
+        #hashRow { display: flex; gap: 4px; align-items: center; }
+        #hash { font-family: monospace; font-size: 11px; flex: 1; }
+        #renderTime { font-size: 11px; color: #666; margin-top: 4px; }
+        .column-section, .row-section { margin-bottom: 8px; padding-left: 8px; border-left: 2px solid #eee; }
     </style>
 </head>
 <body>
     <div id="controls">
-        <!-- Form mode -->
-        <div class="step" id="step0-form">
-            <h3>Form</h3>
-            <label>Mode:
-                <select id="formMode" onchange="onFormModeChange()">
-                    <option value="panel" selected>Panel (MDF)</option>
-                    <option value="vase">Vase (Ceramics)</option>
+        <div class="step" id="step-hash">
+            <h3>Seed</h3>
+            <div id="hashRow">
+                <input type="text" id="hash" value="0xa87e40e21d873faf">
+                <button onclick="regenerateHash()" title="Regenerate">⟳</button>
+            </div>
+            <div id="renderTime"></div>
+        </div>
+
+        <div class="step" id="step1-panel">
+            <h3>1. Panel</h3>
+            <label>Width (mm): <input type="number" id="width" value="500" min="100" max="10000" onkeypress="checkEnterKey(event)"></label>
+            <label>Height (mm): <input type="number" id="height" value="500" min="100" max="10000" onkeypress="checkEnterKey(event)"></label>
+            <label>Thickness (mm): <input type="number" id="panelThickness" value="18" min="1" max="100" onkeypress="checkEnterKey(event)"></label>
+            <label>Columns: <input type="number" id="columns" value="1" min="1" max="10" onchange="updateColumnInputs()" onkeypress="checkEnterKey(event)"></label>
+            <label>Spacing vertical (mm): <input type="number" id="spacing" value="4" min="0" max="100" onkeypress="checkEnterKey(event)"></label>
+            <label>Spacing horizontal (mm): <input type="number" id="spacingHorizontal" value="4" min="0" max="100" onkeypress="checkEnterKey(event)"></label>
+            <div id="column-sections"></div>
+        </div>
+
+        <div class="step" id="step2-material">
+            <h3>2. Material</h3>
+            <label>RAL kleur:
+                <select id="ralCode" onchange="updatePanel()"></select>
+            </label>
+        </div>
+
+        <div class="step" id="step3-carving">
+            <h3>3. Carving</h3>
+            <label>Tool:
+                <select id="bit" onchange="updatePanel()">
+                    <option value="45-deg" selected>45° V-frees (diep)</option>
+                    <option value="30-deg">30° V-frees (ondiep)</option>
+                </select>
+            </label>
+            <label>Placement:
+                <select id="placement" onchange="updatePanel()">
+                    <option value="chaos" selected>Chaos</option>
+                    <option value="grid">Grid</option>
+                    <option value="rows">Rows</option>
+                    <option value="columns">Columns</option>
+                    <option value="cross">Cross</option>
+                    <option value="diamonds">Diamonds</option>
+                    <option value="square">Square</option>
+                </select>
+            </label>
+            <label>Thickness:
+                <select id="strokeThickness" onchange="updatePanel()">
+                    <option value="1">Fine</option>
+                    <option value="2">Thin</option>
+                    <option value="3" selected>Medium</option>
+                    <option value="4">Thick</option>
+                    <option value="5">Chunky</option>
+                </select>
+            </label>
+            <label>Density:
+                <select id="density" onchange="updatePanel()">
+                    <option value="1">Sparse</option>
+                    <option value="2">Loose</option>
+                    <option value="3" selected>Compact</option>
+                    <option value="4">Dense</option>
+                    <option value="5">Wild</option>
+                </select>
+            </label>
+            <label>Scale:
+                <select id="patternScale" onchange="updatePanel()">
+                    <option value="macro">Macro</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="micro">Micro</option>
+                </select>
+            </label>
+            <label>Layers:
+                <select id="layers" onchange="updatePanel()">
+                    <option value="1" selected>One</option>
+                    <option value="2">Two</option>
+                    <option value="8">Many</option>
+                </select>
+            </label>
+            <label>Frame:
+                <select id="frame" onchange="updatePanel()">
+                    <option value="none" selected>None</option>
+                    <option value="thick">Thick</option>
                 </select>
             </label>
         </div>
 
-        <!-- Step 1: Panel -->
-        <div class="step" id="step1-panel">
-            <h3>Step 1: Panel</h3>
-            <label>Total Width: <input type="number" id="width" value="500" min="100" max="10000" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Total Height: <input type="number" id="height" value="500" min="100" max="10000" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Thickness: <input type="number" id="thickness" value="18" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Panel Color: <input type="color" id="panelColor" value="#FF8C00"></label><br>
-            <label>Columns: <input type="number" id="columns" value="1" min="1" max="10" onchange="updateColumnInputs()" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Spacing (Vertical): <input type="number" id="spacing" value="4" min="0" max="100" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Spacing (Horizontal): <input type="number" id="spacingHorizontal" value="4" min="0" max="100" onkeypress="checkEnterKey(event)"></label><br>
-            <div id="column-sections"></div>
-        </div>
-
-        <!-- Step 1b: Vase (only used in vase mode) -->
-        <div class="step" id="step1b-vase" style="display: none;">
-            <h3>Step 1: Vase</h3>
-            <label>Height: <input type="number" id="vaseHeight" value="200" min="50" max="600" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Base radius: <input type="number" id="vaseRadius" value="60" min="20" max="300" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Belly bulge: <input type="range" id="vaseBulge" min="0" max="1.5" step="0.05" value="0.4" onchange="updatePanel()"></label><br>
-            <label>Neck taper: <input type="range" id="vaseNeck" min="0" max="0.9" step="0.05" value="0.3" onchange="updatePanel()"></label><br>
-            <label>Color: <input type="color" id="vaseColor" value="#d8d2c4"></label><br>
-        </div>
-
-        <!-- Step 2: Pattern -->
-        <div class="step" id="step2-pattern">
-            <h3>Step 2: Pattern</h3>
-            <label>Pattern:
-                <select id="pattern" onchange="updatePanel()">
-                    <option value="horizontal">Horizontal</option>
-                    <option value="vertical">Vertical</option>
-                    <option value="cross">Cross</option>
-                </select>
-            </label><br>
-            <label>Min Spacing: <input type="number" id="minSpacing" value="10" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Max Spacing: <input type="number" id="maxSpacing" value="50" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Min Width: <input type="number" id="minWidth" value="5" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
-            <label>Max Width: <input type="number" id="maxWidth" value="15" min="1" max="100" onkeypress="checkEnterKey(event)"></label><br>
-        </div>
-
-        <!-- Step 2b: Style -->
-        <div class="step" id="step2b-style">
-            <h3>Step 2b: Style</h3>
-            <label>Tool:
-                <select id="toolSelect" onchange="updatePanel()">
-                    <option value="cosine" selected>U-groove (cosine)</option>
-                    <option value="vee">V-groove</option>
-                    <option value="square">Square</option>
-                    <option value="round">Round</option>
-                    <option value="random">Random per line</option>
-                </select>
-            </label><br>
-            <label><input type="checkbox" id="organicEnabled" onchange="updatePanel()"> Organic lines</label><br>
-            <label>Wave amplitude (mm): <input type="range" id="organicAmp" min="0" max="20" step="0.5" value="5" onchange="updatePanel()"></label><br>
-            <label>Wave frequency: <input type="range" id="organicFreq" min="0.001" max="0.05" step="0.001" value="0.02" onchange="updatePanel()"></label><br>
-            <label><input type="checkbox" id="mishimaEnabled" onchange="updatePanel()"> Mishima inlay</label><br>
-            <label>Inlay color: <input type="color" id="inlayColor" value="#1a1a1a" onchange="updatePanel()"></label><br>
-            <label>Mishima probability: <input type="range" id="mishimaProb" min="0" max="1" step="0.05" value="1" onchange="updatePanel()"></label><br>
-            <label>Hand-drawn: <input type="checkbox" id="handDrawn" onchange="updatePanel()"> width variance + partial strokes</label><br>
-            <label>Width variance: <input type="range" id="widthVariance" min="0" max="1" step="0.05" value="0.5" onchange="updatePanel()"></label><br>
-            <label>Partial probability: <input type="range" id="partialProb" min="0" max="1" step="0.05" value="0.4" onchange="updatePanel()"></label><br>
-        </div>
-
-        <!-- Step 3: Export -->
-        <div class="step" id="step3-export">
-            <h3>Step 3: Export</h3>
-            <button onclick="previewPDF()">Preview PDF</button>
-            <button onclick="exportModel()">Export Model</button>
-            <button onclick="exportCNC()">Export CNC Code</button>
-            <button onclick="exportZip()">Export All in ZIP</button>
+        <div class="step" id="step4-export">
+            <h3>4. Export</h3>
+            <button onclick="exportPNG()">Export PNG</button>
+            <button onclick="exportModel()">Export OBJ</button>
+            <button onclick="exportZip()">Export ZIP</button>
         </div>
     </div>
 
     <div class="button-container">
-        <button onclick="updatePanel()">Update Panel</button>
-        <button onclick="resetView()">Default View</button>
+        <button onclick="updatePanel()">Update</button>
+        <button onclick="resetView()">Reset view</button>
     </div>
 
     <div id="scene-container"></div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/environments/RoomEnvironment.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/simplex-noise/2.4.0/simplex-noise.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.3.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.3.2/html2canvas.min.js"></script>

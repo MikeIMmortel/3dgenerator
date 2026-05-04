@@ -1,219 +1,463 @@
-let scene, camera, renderer, panel, ambientLight, directionalLight;
-const simplex = new SimplexNoise();
-let carvingLines = [];
-let currentLinesData = [];
-let adjustedValues = {}; // To store adjusted values by the user
+// MDF V-Frees Generator
+// Pipeline: 2D depth canvas (V-bit profile gradients) → per-cell PlaneGeometry
+// vertex displacement → MeshPhysicalMaterial + RoomEnvironment.
 
-const MIN_CAMERA_Z = 50;
-const MAX_CAMERA_Z = 8000;
+// === Globals ===
+let scene, camera, renderer;
+let depthCanvas, depthCtx;
+let cellMeshes = [];
+let adjustedValues = {};
+let isMouseDown = false, mouseX = 0, mouseY = 0;
+let targetRotationX = 0, targetRotationY = 0;
+let cameraDistance = 800;
 
-let isMouseDown = false;
-let mouseX = 0;
-let mouseY = 0;
-let targetRotationX = 0;
-let targetRotationY = 0;
+// === Constants ===
+const RAL_PALETTE = [
+    { code: 'RAL 9010', name: 'Zuiver wit',     hex: '#F1ECE0' },
+    { code: 'RAL 9016', name: 'Verkeerswit',    hex: '#F1F0EA' },
+    { code: 'RAL 9001', name: 'Cremewit',       hex: '#EAE0CC' },
+    { code: 'RAL 1013', name: 'Parelwit',       hex: '#E3D9C6' },
+    { code: 'RAL 1015', name: 'Lichtivoor',     hex: '#E1CC9A' },
+    { code: 'RAL 7035', name: 'Lichtgrijs',     hex: '#CBD0CC' },
+    { code: 'RAL 7044', name: 'Zijdegrijs',     hex: '#B9B4A1' },
+    { code: 'RAL 7016', name: 'Antracietgrijs', hex: '#293133' },
+    { code: 'RAL 9005', name: 'Gitzwart',       hex: '#0A0A0A' },
+    { code: 'RAL 5014', name: 'Duifblauw',      hex: '#637D96' },
+    { code: 'RAL 5011', name: 'Staalblauw',     hex: '#1A2B3C' },
+    { code: 'RAL 6021', name: 'Bleekgroen',     hex: '#89AC76' },
+    { code: 'RAL 6005', name: 'Mosgroen',       hex: '#2F4538' },
+    { code: 'RAL 3009', name: 'Oxiderood',      hex: '#6D3F33' },
+    { code: 'RAL 8017', name: 'Chocoladebruin', hex: '#45322E' },
+];
 
-const DEFAULT_PANEL_COLOR = 0xFF8C00;
-const noiseScaleValues = [0.005, 0.01, 0.015, 0.02, 0.025];
+const THICKNESS_MM = { 1: 1.5, 2: 3, 3: 5, 4: 8, 5: 12 };
+const DENSITY_PER_AREA = { 1: 0.25, 2: 0.7, 3: 1.8, 4: 4, 5: 9 }; // strokes per 100x100mm
+const SCALE_FREQ = { macro: 0.003, medium: 0.008, micro: 0.02 };
 
-// Cross-section profiles for carving "tools". Input t = distance / (lineWidth/2),
-// expected to be in [0, 1]. Output is a depth fraction in [0, 1] where 1 = max depth.
-const TOOL_PROFILES = {
-    cosine: (t) => Math.cos(Math.PI * t / 2),    // current behavior — broad U-groove
-    vee:    (t) => 1 - Math.abs(t),              // sharp V-groove
-    square: () => 1,                             // flat-bottom rectangular pocket
-    round:  (t) => Math.sqrt(Math.max(0, 1 - t * t)),  // semicircle
-};
-const TOOL_NAMES = ['cosine', 'vee', 'square', 'round'];
+const MAX_DEPTH_MM = 6;       // grayscale 255 -> 6 mm physical depth
+const CANVAS_RES = 1000;      // long side of depth canvas in pixels
+const PLANE_SEG_PER_MM = 1;   // PlaneGeometry segment density (1 vertex per mm)
+const PLANE_SEG_CAP = 500;    // cap per axis to keep buffer size sane
 
-function profileDepthFraction(toolName, t) {
-    const fn = TOOL_PROFILES[toolName] || TOOL_PROFILES.cosine;
-    return fn(Math.min(1, Math.max(0, t)));
+// === Seeded PRNG (mulberry32) ===
+function hashToSeed(hash) {
+    const h = (hash || '').replace(/^0x/, '');
+    let s = 0;
+    for (let i = 0; i < h.length; i++) {
+        s = (s * 16 + (parseInt(h[i], 16) || 0)) | 0;
+    }
+    return Math.abs(s) || 1;
 }
 
-function readStyleOpts() {
-    const toolEl = document.getElementById('toolSelect');
-    const toolValue = toolEl ? toolEl.value : 'cosine';
-    return {
-        toolMode: toolValue === 'random' ? 'random' : 'fixed',
-        tool: toolValue === 'random' ? 'cosine' : toolValue,
-        organic: !!(document.getElementById('organicEnabled') && document.getElementById('organicEnabled').checked),
-        organicAmp: parseFloat((document.getElementById('organicAmp') || { value: 0 }).value),
-        organicFreq: parseFloat((document.getElementById('organicFreq') || { value: 0.02 }).value),
-        mishimaEnabled: !!(document.getElementById('mishimaEnabled') && document.getElementById('mishimaEnabled').checked),
-        mishimaProb: parseFloat((document.getElementById('mishimaProb') || { value: 1 }).value),
-        handDrawn: !!(document.getElementById('handDrawn') && document.getElementById('handDrawn').checked),
-        widthVariance: parseFloat((document.getElementById('widthVariance') || { value: 0 }).value),
-        partialProb: parseFloat((document.getElementById('partialProb') || { value: 0 }).value),
+function mulberry32(seed) {
+    let s = seed >>> 0;
+    return function () {
+        s = (s + 0x6D2B79F5) | 0;
+        let t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
 }
 
-function decorateLine(line, opts) {
-    line.tool = opts.toolMode === 'random'
-        ? TOOL_NAMES[Math.floor(Math.random() * TOOL_NAMES.length)]
-        : (opts.tool || 'cosine');
-    line.organic = !!opts.organic;
-    line.organicAmp = opts.organicAmp || 0;
-    line.organicFreq = opts.organicFreq || 0.02;
-    line.seed = Math.random() * 1000;
-    line.mishima = !!(opts.mishimaEnabled && Math.random() < (opts.mishimaProb != null ? opts.mishimaProb : 1));
-    line.handDrawn = !!opts.handDrawn;
-    line.widthVariance = opts.widthVariance || 0;
-    line.partialProb = opts.partialProb || 0;
-    line.widthSeed = Math.random() * 1000;
-    line.maskSeed = Math.random() * 1000;
-    return line;
+function regenerateHash() {
+    const chars = '0123456789abcdef';
+    let h = '0x';
+    for (let i = 0; i < 16; i++) h += chars[Math.floor(Math.random() * 16)];
+    document.getElementById('hash').value = h;
+    updatePanel();
 }
 
+// === V-bit profile ===
+function vBitMaxDepthRatio(bit) {
+    if (bit === '30-deg') return Math.tan(30 * Math.PI / 180) / 2; // ≈0.2887
+    return 0.5; // 45-deg
+}
+function vBitProfile(bit) {
+    const max = vBitMaxDepthRatio(bit);
+    return (t) => Math.min(t, 1 - t) * 2 * max; // depth ratio at normalized cross-section position t∈[0,1]
+}
+
+// === RAL ===
+function populateRALSelect() {
+    const sel = document.getElementById('ralCode');
+    if (!sel || sel.options.length > 0) return;
+    RAL_PALETTE.forEach((c) => {
+        const opt = document.createElement('option');
+        opt.value = c.code;
+        opt.textContent = `${c.code} — ${c.name}`;
+        if (c.code === 'RAL 7035') opt.selected = true;
+        sel.appendChild(opt);
+    });
+}
+function getRALHex(code) {
+    const f = RAL_PALETTE.find((c) => c.code === code);
+    return f ? f.hex : '#cccccc';
+}
+
+// === Init ===
 function init() {
     scene = new THREE.Scene();
-    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10000);
-    camera.position.z = 1000;
+    scene.background = new THREE.Color(0xeeeeee);
 
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 6000);
+    camera.position.set(0, 0, cameraDistance);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setClearColor(0x000000, 0); // Transparent background
+    if ('outputEncoding' in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
     document.getElementById('scene-container').appendChild(renderer.domElement);
 
-    ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
-    scene.add(ambientLight);
+    // Environment for PBR reflections
+    if (typeof THREE.RoomEnvironment === 'function') {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        pmrem.compileEquirectangularShader();
+        scene.environment = pmrem.fromScene(new THREE.RoomEnvironment(), 0.04).texture;
+    }
 
-    directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
-    directionalLight.position.set(1, 1, 1);
-    scene.add(directionalLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+    const key = new THREE.DirectionalLight(0xffffff, 1.1);
+    key.position.set(-300, 400, 500); // upper-left, ~45° down-right
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+    fill.position.set(300, -200, 200);
+    scene.add(fill);
 
+    depthCanvas = document.createElement('canvas');
+    depthCtx = depthCanvas.getContext('2d');
+
+    populateRALSelect();
+    updateColumnInputs();
     createPanel();
 
     renderer.domElement.addEventListener('mousedown', onMouseDown, false);
     renderer.domElement.addEventListener('mousemove', onMouseMove, false);
     renderer.domElement.addEventListener('mouseup', onMouseUp, false);
     renderer.domElement.addEventListener('wheel', onMouseWheel, false);
-
     window.addEventListener('resize', onWindowResize, false);
 
     animate();
 }
 
-function createPanel() {
-    clearScene();
+// === Stroke generation ===
+function generateStrokes(panelW, panelH, params, rng) {
+    const { strokeWidthMm, densityPerArea, placement, scaleFreq, layers } = params;
+    const area = (panelW * panelH) / 10000; // in 100x100mm units
+    const strokesPerLayer = Math.max(2, Math.round(densityPerArea * area));
+    const strokeStepMm = Math.max(0.5, strokeWidthMm * 0.5);
+    const strokeMaxLength = Math.min(panelW, panelH) * 0.8;
 
-    // Ensure dynamic column/row inputs exist for the current `columns` value
-    // before we read or write to them. Without this, pressing Enter on the
-    // columns field renders before onchange has regenerated the inputs.
+    const simplexInst = new SimplexNoise(rng);
+    const flow = (x, y) => simplexInst.noise2D(x * scaleFreq, y * scaleFreq) * Math.PI * 2;
+
+    const strokes = [];
+    for (let layer = 0; layer < layers; layer++) {
+        for (let i = 0; i < strokesPerLayer; i++) {
+            const seedPt = pickSeedPoint(placement, panelW, panelH, i, strokesPerLayer, densityPerArea, rng);
+            let x = seedPt.x;
+            let y = seedPt.y;
+
+            const points = [];
+            const maxSteps = Math.floor(strokeMaxLength / strokeStepMm);
+            const stepCount = Math.max(6, Math.floor(maxSteps * (0.4 + rng() * 0.6)));
+            const baseWidth = strokeWidthMm * (0.85 + rng() * 0.3);
+
+            for (let s = 0; s < stepCount; s++) {
+                points.push({ x, y, w: baseWidth });
+                const ang = flow(x, y);
+                x += Math.cos(ang) * strokeStepMm;
+                y += Math.sin(ang) * strokeStepMm;
+                if (x < -panelW / 2 - 20 || x > panelW / 2 + 20 ||
+                    y < -panelH / 2 - 20 || y > panelH / 2 + 20) break;
+            }
+
+            // Taper start/end so strokes don't end abruptly
+            const taperLen = Math.max(2, Math.floor(points.length * 0.15));
+            for (let s = 0; s < points.length; s++) {
+                let factor = 1;
+                if (s < taperLen) factor = s / taperLen;
+                else if (s > points.length - taperLen) factor = (points.length - s) / taperLen;
+                points[s].w *= factor;
+            }
+            strokes.push(points);
+        }
+    }
+    return strokes;
+}
+
+function pickSeedPoint(placement, W, H, i, total, density, rng) {
+    switch (placement) {
+        case 'grid': {
+            const cols = Math.max(2, Math.ceil(Math.sqrt(total * (W / H))));
+            const rows = Math.max(2, Math.ceil(total / cols));
+            const ci = i % cols;
+            const ri = Math.floor(i / cols) % rows;
+            const sx = -W / 2 + (ci + 0.5) * W / cols + (rng() - 0.5) * (W / cols) * 0.25;
+            const sy = -H / 2 + (ri + 0.5) * H / rows + (rng() - 0.5) * (H / rows) * 0.25;
+            return { x: sx, y: sy };
+        }
+        case 'rows': {
+            const numRows = Math.max(3, Math.round(density * H / 60));
+            const ri = i % numRows;
+            const sy = -H / 2 + (ri + 0.5) * H / numRows + (rng() - 0.5) * 4;
+            return { x: -W / 2 + rng() * W, y: sy };
+        }
+        case 'columns': {
+            const numCols = Math.max(3, Math.round(density * W / 60));
+            const ci = i % numCols;
+            const sx = -W / 2 + (ci + 0.5) * W / numCols + (rng() - 0.5) * 4;
+            return { x: sx, y: -H / 2 + rng() * H };
+        }
+        case 'cross': {
+            if (rng() < 0.5) {
+                return { x: -W / 2 + rng() * W, y: (rng() - 0.5) * H * 0.18 };
+            }
+            return { x: (rng() - 0.5) * W * 0.18, y: -H / 2 + rng() * H };
+        }
+        case 'diamonds': {
+            const cx = (rng() < 0.5 ? -1 : 1) * W * 0.3 * rng();
+            const cy = (rng() < 0.5 ? -1 : 1) * H * 0.3 * rng();
+            const ang = rng() * Math.PI * 2;
+            const r = rng() * Math.min(W, H) * 0.18;
+            return { x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r };
+        }
+        case 'square': {
+            const block = Math.floor(rng() * 4);
+            const bx = (block % 2) * W * 0.5 - W * 0.25;
+            const by = Math.floor(block / 2) * H * 0.5 - H * 0.25;
+            return { x: bx + (rng() - 0.5) * W * 0.4, y: by + (rng() - 0.5) * H * 0.4 };
+        }
+        case 'chaos':
+        default:
+            return { x: -W / 2 + rng() * W, y: -H / 2 + rng() * H };
+    }
+}
+
+// === Depth canvas rendering ===
+function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
+    const long = Math.max(panelW, panelH);
+    const cw = Math.round(CANVAS_RES * (panelW / long));
+    const ch = Math.round(CANVAS_RES * (panelH / long));
+    depthCanvas.width = cw;
+    depthCanvas.height = ch;
+    const ctx = depthCtx;
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.globalCompositeOperation = 'lighten';
+
+    const profile = vBitProfile(bit);
+    const maxRatio = vBitMaxDepthRatio(bit);
+    const mmToPx = cw / panelW;
+
+    const px = (mx) => (mx + panelW / 2) * mmToPx;
+    const py = (my) => ch - (my + panelH / 2) * (ch / panelH);
+
+    for (const stroke of strokes) {
+        if (stroke.length < 2) continue;
+        for (let i = 0; i < stroke.length - 1; i++) {
+            const a = stroke[i];
+            const b = stroke[i + 1];
+            if (a.w < 0.05 && b.w < 0.05) continue;
+
+            const ax = px(a.x), ay = py(a.y);
+            const bx = px(b.x), by = py(b.y);
+            const sdx = bx - ax, sdy = by - ay;
+            const len = Math.hypot(sdx, sdy);
+            if (len < 0.01) continue;
+            const nx = -sdy / len, ny = sdx / len;
+            const aHalf = (a.w / 2) * mmToPx;
+            const bHalf = (b.w / 2) * mmToPx;
+            const halfMax = Math.max(aHalf, bHalf, 1);
+
+            const p0x = ax + nx * aHalf, p0y = ay + ny * aHalf;
+            const p1x = bx + nx * bHalf, p1y = by + ny * bHalf;
+            const p2x = bx - nx * bHalf, p2y = by - ny * bHalf;
+            const p3x = ax - nx * aHalf, p3y = ay - ny * aHalf;
+
+            // Midpoint of the segment for the gradient axis
+            const midX = (ax + bx) / 2;
+            const midY = (ay + by) / 2;
+            const grad = ctx.createLinearGradient(
+                midX + nx * halfMax, midY + ny * halfMax,
+                midX - nx * halfMax, midY - ny * halfMax
+            );
+            const peakDepthMm = ((a.w + b.w) / 2) * maxRatio;
+            const peakG = Math.min(255, Math.round((peakDepthMm / MAX_DEPTH_MM) * 255));
+            const samples = 9;
+            for (let s = 0; s < samples; s++) {
+                const t = s / (samples - 1);
+                const profileFrac = profile(t) / maxRatio; // 0..1
+                const g = Math.round(profileFrac * peakG);
+                grad.addColorStop(t, `rgb(${g},${g},${g})`);
+            }
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.moveTo(p0x, p0y);
+            ctx.lineTo(p1x, p1y);
+            ctx.lineTo(p2x, p2y);
+            ctx.lineTo(p3x, p3y);
+            ctx.closePath();
+            ctx.fill();
+        }
+    }
+
+    if (frame === 'thick') {
+        const margin = Math.round(Math.min(cw, ch) * 0.06);
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, cw, margin);
+        ctx.fillRect(0, ch - margin, cw, margin);
+        ctx.fillRect(0, 0, margin, ch);
+        ctx.fillRect(cw - margin, 0, margin, ch);
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+}
+
+// === Sample depth canvas at a panel coordinate ===
+function sampleDepth(imageData, cw, ch, panelW, panelH, panelX, panelY) {
+    const px = Math.floor((panelX + panelW / 2) / panelW * cw);
+    const py = Math.floor(ch - (panelY + panelH / 2) / panelH * ch);
+    if (px < 0 || px >= cw || py < 0 || py >= ch) return 0;
+    const idx = (py * cw + px) * 4;
+    return (imageData[idx] / 255) * MAX_DEPTH_MM;
+}
+
+// === createPanel: full pipeline ===
+function createPanel() {
+    const t0 = performance.now();
+    clearScene();
     updateColumnInputs();
 
-    const width = parseFloat(document.getElementById('width').value);
-    const height = parseFloat(document.getElementById('height').value);
-    const thickness = parseFloat(document.getElementById('thickness').value);
+    const panelW = parseFloat(document.getElementById('width').value);
+    const panelH = parseFloat(document.getElementById('height').value);
     const columns = parseInt(document.getElementById('columns').value);
     const spacing = parseFloat(document.getElementById('spacing').value);
     const spacingHorizontal = parseFloat(document.getElementById('spacingHorizontal').value);
-    const panelColor = new THREE.Color(document.getElementById('panelColor').value);
 
+    const ralCode = document.getElementById('ralCode').value;
+    const ralHex = getRALHex(ralCode);
+    const bit = document.getElementById('bit').value;
+    const placement = document.getElementById('placement').value;
+    const thicknessLevel = parseInt(document.getElementById('strokeThickness').value);
+    const densityLevel = parseInt(document.getElementById('density').value);
+    const scaleKey = document.getElementById('patternScale').value;
+    const layers = parseInt(document.getElementById('layers').value);
+    const frame = document.getElementById('frame').value;
+    const hash = document.getElementById('hash').value;
+
+    const strokeWidthMm = THICKNESS_MM[thicknessLevel];
+    const densityPerArea = DENSITY_PER_AREA[densityLevel];
+    const scaleFreq = SCALE_FREQ[scaleKey];
+
+    const seed = hashToSeed(hash);
+    const rng = mulberry32(seed);
+
+    const strokes = generateStrokes(panelW, panelH, {
+        strokeWidthMm, densityPerArea, placement, scaleFreq, layers,
+    }, rng);
+
+    renderDepthCanvas(panelW, panelH, strokes, bit, frame);
+    const cw = depthCanvas.width;
+    const ch = depthCanvas.height;
+    const imageData = depthCtx.getImageData(0, 0, cw, ch).data;
+
+    // Per-cell column widths
     let totalSpecifiedWidth = 0;
     const columnWidths = [];
     for (let i = 0; i < columns - 1; i++) {
-        const colWidth = adjustedValues[`colWidth${i + 1}`] || (width - (columns - 1) * spacing) / columns;
+        const colWidth = adjustedValues[`colWidth${i + 1}`] || (panelW - (columns - 1) * spacing) / columns;
         columnWidths.push(colWidth);
         totalSpecifiedWidth += colWidth;
-        document.getElementById(`colWidth${i + 1}`).value = colWidth; // Set adjusted or default value
+        const el = document.getElementById(`colWidth${i + 1}`);
+        if (el) el.value = colWidth;
     }
-    const lastColumnWidth = width - totalSpecifiedWidth - (columns - 1) * spacing;
+    const lastColumnWidth = panelW - totalSpecifiedWidth - (columns - 1) * spacing;
     columnWidths.push(lastColumnWidth);
-    if (document.getElementById(`colWidth${columns}`)) {
-        document.getElementById(`colWidth${columns}`).value = lastColumnWidth; // Set value but not adjustable
-        document.getElementById(`colWidth${columns}`).disabled = true;
-    }
+    const lastColEl = document.getElementById(`colWidth${columns}`);
+    if (lastColEl) { lastColEl.value = lastColumnWidth; lastColEl.disabled = true; }
 
-    carvingLines = [];
-
-    const minWidth = parseFloat(document.getElementById('minWidth').value);
-    const maxWidth = parseFloat(document.getElementById('maxWidth').value);
-
-    const styleOpts = readStyleOpts();
-
-    const globalLinesData = generateGlobalLinesData(
-        document.getElementById('pattern').value,
-        width, height, columns, spacing,
-        parseFloat(document.getElementById('minSpacing').value),
-        parseFloat(document.getElementById('maxSpacing').value),
-        minWidth,
-        maxWidth,
-        styleOpts
-    );
-
-    currentLinesData = globalLinesData;
-    globalLinesData.forEach(line => {
-        const samples = sampleLineCenterline(line, width, height);
-        const segments = [];
-        for (let s = 0; s < samples.length - 1; s++) {
-            segments.push({ start: samples[s], end: samples[s + 1] });
-        }
-        carvingLines.push(segments);
-    });
-
-    const useMishima = styleOpts.mishimaEnabled;
-    const inlayColor = new THREE.Color(document.getElementById('inlayColor').value);
-    const maxLineDepth = globalLinesData.reduce((m, l) => Math.max(m, l.lineDepth), 0) || 1;
-
-    // Pick segment density adaptively: ~4 segments across the smallest line width,
-    // capped so we don't blow up the vertex count for large multi-cell panels.
-    const segPerMM = Math.max(0.05, 4 / Math.max(1, minWidth));
-
-    let xOffset = -width / 2 + columnWidths[0] / 2;
+    let xOffset = -panelW / 2 + columnWidths[0] / 2;
     for (let i = 0; i < columns; i++) {
         const rowsEl = document.getElementById(`rows${i + 1}`);
         const rows = rowsEl ? parseInt(rowsEl.value) : (adjustedValues[`rows${i + 1}`] || 1);
         let totalSpecifiedHeight = 0;
         const rowHeights = [];
         for (let j = 0; j < rows - 1; j++) {
-            const rowHeight = adjustedValues[`rowHeight${i + 1}_${j + 1}`] || (height - (rows - 1) * spacingHorizontal) / rows;
+            const rowHeight = adjustedValues[`rowHeight${i + 1}_${j + 1}`] || (panelH - (rows - 1) * spacingHorizontal) / rows;
             rowHeights.push(rowHeight);
             totalSpecifiedHeight += rowHeight;
             const rhEl = document.getElementById(`rowHeight${i + 1}_${j + 1}`);
             if (rhEl) rhEl.value = rowHeight;
         }
-        const lastRowHeight = height - totalSpecifiedHeight - (rows - 1) * spacingHorizontal;
+        const lastRowHeight = panelH - totalSpecifiedHeight - (rows - 1) * spacingHorizontal;
         rowHeights.push(lastRowHeight);
         const lastRhEl = document.getElementById(`rowHeight${i + 1}_${rows}`);
-        if (lastRhEl) {
-            lastRhEl.value = lastRowHeight;
-            lastRhEl.disabled = true;
-        }
+        if (lastRhEl) { lastRhEl.value = lastRowHeight; lastRhEl.disabled = true; }
 
-        let yOffset = -height / 2 + rowHeights[0] / 2;
+        let yOffset = -panelH / 2 + rowHeights[0] / 2;
         for (let j = 0; j < rows; j++) {
-            const wSegs = Math.min(300, Math.max(20, Math.ceil(columnWidths[i] * segPerMM)));
-            const hSegs = Math.min(300, Math.max(20, Math.ceil(rowHeights[j] * segPerMM)));
-            const geometry = new THREE.BoxGeometry(columnWidths[i], rowHeights[j], thickness, wSegs, hSegs, 1);
-            const material = new THREE.MeshPhongMaterial({ color: panelColor, vertexColors: useMishima });
-            const newPanel = new THREE.Mesh(geometry, material);
-            newPanel.position.set(
-                xOffset,
-                yOffset,
-                0
-            );
-            scene.add(newPanel);
+            const cellW = columnWidths[i];
+            const cellH = rowHeights[j];
+            const wSegs = Math.min(PLANE_SEG_CAP, Math.max(20, Math.ceil(cellW * PLANE_SEG_PER_MM)));
+            const hSegs = Math.min(PLANE_SEG_CAP, Math.max(20, Math.ceil(cellH * PLANE_SEG_PER_MM)));
+            const geometry = new THREE.PlaneGeometry(cellW, cellH, wSegs, hSegs);
+            const positions = geometry.attributes.position;
 
-            const inlayMask = useMishima ? new Map() : null;
-            const displacement = applyGlobalLinesToPanel(
-                geometry, columnWidths[i], rowHeights[j], thickness,
-                globalLinesData, xOffset, yOffset, width, height, inlayMask
-            );
-            if (useMishima) {
-                applyInlayColors(geometry, displacement, inlayMask, panelColor, inlayColor, maxLineDepth, thickness);
+            for (let v = 0; v < positions.count; v++) {
+                const vx = positions.getX(v);
+                const vy = positions.getY(v);
+                const px = xOffset + vx;
+                const py = yOffset + vy;
+                const depth = sampleDepth(imageData, cw, ch, panelW, panelH, px, py);
+                positions.setZ(v, -depth);
             }
-
+            positions.needsUpdate = true;
             geometry.computeVertexNormals();
+
+            const isDark = isHexDark(ralHex);
+            const material = new THREE.MeshPhysicalMaterial({
+                color: ralHex,
+                roughness: 0.35,
+                metalness: 0.0,
+                clearcoat: isDark ? 0.55 : 0.4,
+                clearcoatRoughness: 0.3,
+                reflectivity: 0.4,
+                side: THREE.FrontSide,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(xOffset, yOffset, 0);
+            scene.add(mesh);
+            cellMeshes.push(mesh);
+
             yOffset += rowHeights[j] / 2 + (j < rows - 1 ? rowHeights[j + 1] / 2 : 0) + spacingHorizontal;
         }
         xOffset += columnWidths[i] / 2 + (i < columns - 1 ? columnWidths[i + 1] / 2 : 0) + spacing;
     }
 
     fitPanelToView();
+
+    const t1 = performance.now();
+    const rt = document.getElementById('renderTime');
+    if (rt) {
+        rt.textContent = `Render: ${((t1 - t0) / 1000).toFixed(2)}s — ${strokes.length} strokes, depth canvas ${cw}×${ch}`;
+    }
 }
 
+function isHexDark(hex) {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.substr(0, 2), 16);
+    const g = parseInt(h.substr(2, 2), 16);
+    const b = parseInt(h.substr(4, 2), 16);
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 100;
+}
+
+// === Column / row dynamic inputs ===
 function updateColumnInputs() {
     const columns = parseInt(document.getElementById('columns').value);
     const totalWidth = parseFloat(document.getElementById('width').value);
@@ -226,20 +470,18 @@ function updateColumnInputs() {
     for (let i = 0; i < columns; i++) {
         const columnSection = document.createElement('div');
         columnSection.className = 'column-section';
-        let colWidth = '';
-
+        let colWidth;
         if (i < columns - 1) {
             colWidth = adjustedValues[`colWidth${i + 1}`] || ((totalWidth - (columns - 1) * spacing) / columns);
             totalSpecifiedWidth += colWidth;
         } else {
             colWidth = totalWidth - totalSpecifiedWidth - (columns - 1) * spacing;
         }
-
         const rowsValue = adjustedValues[`rows${i + 1}`] || 1;
 
         columnSection.innerHTML = `
-            <label>Column ${i + 1} Width: <input type="number" id="colWidth${i + 1}" value="${colWidth}" ${i === columns - 1 ? 'disabled' : ''} min="10" max="10000" onchange="onInputChange('colWidth${i + 1}')" onkeypress="checkEnterKey(event)"></label>
-            <label>Rows in Column ${i + 1}: <input type="number" id="rows${i + 1}" value="${rowsValue}" min="1" max="10" onchange="onRowsChange(${i + 1})" onkeypress="checkEnterKey(event)"></label>
+            <label>Col ${i + 1} width: <input type="number" id="colWidth${i + 1}" value="${colWidth}" ${i === columns - 1 ? 'disabled' : ''} min="10" max="10000" onchange="onInputChange('colWidth${i + 1}')" onkeypress="checkEnterKey(event)"></label>
+            <label>Rows in col ${i + 1}: <input type="number" id="rows${i + 1}" value="${rowsValue}" min="1" max="10" onchange="onRowsChange(${i + 1})" onkeypress="checkEnterKey(event)"></label>
             <div id="row-sections${i + 1}" class="row-section"></div>
         `;
         columnSectionsDiv.appendChild(columnSection);
@@ -257,31 +499,27 @@ function updateRowInputs(columnIndex) {
     let totalSpecifiedHeight = 0;
 
     for (let i = 0; i < rows; i++) {
-        let rowHeight = '';
-
+        let rowHeight;
         if (i < rows - 1) {
             rowHeight = adjustedValues[`rowHeight${columnIndex}_${i + 1}`] || ((totalHeight - (rows - 1) * spacingHorizontal) / rows);
             totalSpecifiedHeight += rowHeight;
         } else {
             rowHeight = totalHeight - totalSpecifiedHeight - (rows - 1) * spacingHorizontal;
         }
-
         const rowLabel = document.createElement('label');
-        rowLabel.innerHTML = `Row ${i + 1} Height: <input type="number" id="rowHeight${columnIndex}_${i + 1}" value="${rowHeight}" ${i === rows - 1 ? 'disabled' : ''} min="10" max="10000" onchange="onInputChange('rowHeight${columnIndex}_${i + 1}')" onkeypress="checkEnterKey(event)"><br>`;
+        rowLabel.innerHTML = `Row ${i + 1} height: <input type="number" id="rowHeight${columnIndex}_${i + 1}" value="${rowHeight}" ${i === rows - 1 ? 'disabled' : ''} min="10" max="10000" onchange="onInputChange('rowHeight${columnIndex}_${i + 1}')" onkeypress="checkEnterKey(event)"><br>`;
         rowSectionsDiv.appendChild(rowLabel);
     }
 }
 
 function onRowsChange(columnIndex) {
     adjustedValues[`rows${columnIndex}`] = parseInt(document.getElementById(`rows${columnIndex}`).value);
-    updateRowInputs(columnIndex); // Reinitialize rows input fields
-    updatePanel(); // Update panel when rows change
+    updateRowInputs(columnIndex);
+    updatePanel();
 }
 
 function checkEnterKey(event) {
-    if (event.keyCode === 13) { // Enter key
-        updatePanel();
-    }
+    if (event.keyCode === 13) updatePanel();
 }
 
 function onInputChange(inputId) {
@@ -289,488 +527,58 @@ function onInputChange(inputId) {
     updatePanel();
 }
 
-updateColumnInputs();
-
-function generateGlobalLinesData(patternType, width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth, styleOpts) {
-    const opts = styleOpts || {};
-    const linesData = [];
-
-    const decorate = (line) => decorateLine(line, opts);
-
-    if (patternType === 'horizontal') {
-        let y = -height / 2;
-        const maxY = height / 2;
-        while (y < maxY) {
-            const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
-            const lineDepth = lineWidth / 3;
-            linesData.push(decorate({ y, lineWidth, lineDepth }));
-            y += lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
-        }
-    } else if (patternType === 'vertical') {
-        let x = -width / 2;
-        const maxX = width / 2;
-        while (x < maxX) {
-            const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
-            const lineDepth = lineWidth / 3;
-            linesData.push(decorate({ x, lineWidth, lineDepth }));
-            x += lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
-        }
-    } else if (patternType === 'cross') {
-        generateGlobalLinesData('horizontal', width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth, opts).forEach(line => linesData.push(line));
-        generateGlobalLinesData('vertical', width, height, columns, spacing, minSpacing, maxSpacing, minWidth, maxWidth, opts).forEach(line => linesData.push(line));
-    }
-
-    return linesData;
-}
-
-// Returns polyline samples for a line in panel-global coords (origin at panel center).
-// Straight line -> 2 samples (start, end). Organic -> stepped samples along simplex-noise wave.
-function sampleLineCenterline(line, panelW, panelH) {
-    const isVertical = line.hasOwnProperty('x');
-    const baseCoord = isVertical ? line.x : line.y;
-    const along0 = isVertical ? -panelH / 2 : -panelW / 2;
-    const along1 = isVertical ? panelH / 2 : panelW / 2;
-
-    if (!line.organic || !line.organicAmp) {
-        if (isVertical) return [{ x: baseCoord, y: along0 }, { x: baseCoord, y: along1 }];
-        return [{ x: along0, y: baseCoord }, { x: along1, y: baseCoord }];
-    }
-
-    const step = Math.max(0.5, Math.min(2, line.lineWidth));
-    const seed = line.seed || 0;
-    const freq = line.organicFreq;
-    const amp = line.organicAmp;
-    const samples = [];
-    let along = along0;
-    while (along < along1) {
-        const offset = amp * simplex.noise2D(along * freq, seed);
-        if (isVertical) samples.push({ x: baseCoord + offset, y: along });
-        else samples.push({ x: along, y: baseCoord + offset });
-        along += step;
-    }
-    const endOffset = amp * simplex.noise2D(along1 * freq, seed);
-    if (isVertical) samples.push({ x: baseCoord + endOffset, y: along1 });
-    else samples.push({ x: along1, y: baseCoord + endOffset });
-    return samples;
-}
-
-function applyGlobalLinesToPanel(geometry, width, height, thickness, linesData, xOffset, yOffset, panelW, panelH, vertexInlayMask) {
-    const positions = geometry.attributes.position;
-    const vertexDisplacement = new Map();
-
-    // Cache front-face vertices once to avoid scanning all 6 faces per line.
-    const frontX = [], frontY = [], frontI = [];
-    for (let i = 0; i < positions.count; i++) {
-        if (Math.abs(positions.getZ(i) - thickness / 2) < 0.01) {
-            frontX.push(positions.getX(i));
-            frontY.push(positions.getY(i));
-            frontI.push(i);
-        }
-    }
-    const N = frontI.length;
-
-    // Coarse spatial grid so per-segment lookups don't scan the whole front face.
-    const gridSize = 20;
-    const gridCols = Math.max(1, Math.ceil(width / gridSize)) + 1;
-    const gridRows = Math.max(1, Math.ceil(height / gridSize)) + 1;
-    const grid = new Array(gridCols * gridRows);
-    for (let k = 0; k < N; k++) {
-        const cx = Math.min(gridCols - 1, Math.max(0, Math.floor((frontX[k] + width / 2) / gridSize)));
-        const cy = Math.min(gridRows - 1, Math.max(0, Math.floor((frontY[k] + height / 2) / gridSize)));
-        const g = cy * gridCols + cx;
-        if (!grid[g]) grid[g] = [];
-        grid[g].push(k);
-    }
-
-    linesData.forEach(line => {
-        const samples = sampleLineCenterline(line, panelW, panelH);
-        const halfW = line.lineWidth / 2;
-        const tool = line.tool || 'cosine';
-
-        for (let s = 0; s < samples.length - 1; s++) {
-            // Convert global -> cell-local
-            const ax = samples[s].x - xOffset;
-            const ay = samples[s].y - yOffset;
-            const bx = samples[s + 1].x - xOffset;
-            const by = samples[s + 1].y - yOffset;
-            const dx = bx - ax;
-            const dy = by - ay;
-            const lenSq = dx * dx + dy * dy;
-            if (lenSq === 0) continue;
-
-            const minX = Math.min(ax, bx) - halfW;
-            const maxX = Math.max(ax, bx) + halfW;
-            const minY = Math.min(ay, by) - halfW;
-            const maxY = Math.max(ay, by) + halfW;
-
-            const cxMin = Math.max(0, Math.floor((minX + width / 2) / gridSize));
-            const cxMax = Math.min(gridCols - 1, Math.floor((maxX + width / 2) / gridSize));
-            const cyMin = Math.max(0, Math.floor((minY + height / 2) / gridSize));
-            const cyMax = Math.min(gridRows - 1, Math.floor((maxY + height / 2) / gridSize));
-            if (cxMin > cxMax || cyMin > cyMax) continue;
-
-            for (let cy = cyMin; cy <= cyMax; cy++) {
-                for (let cx = cxMin; cx <= cxMax; cx++) {
-                    const bucket = grid[cy * gridCols + cx];
-                    if (!bucket) continue;
-                    for (let m = 0; m < bucket.length; m++) {
-                        const k = bucket[m];
-                        const vx = frontX[k];
-                        const vy = frontY[k];
-                        if (vx < minX || vx > maxX || vy < minY || vy > maxY) continue;
-                        const t = ((vx - ax) * dx + (vy - ay) * dy) / lenSq;
-                        if (t < 0 || t > 1) continue;
-                        const projX = ax + t * dx;
-                        const projY = ay + t * dy;
-                        const distance = Math.hypot(vx - projX, vy - projY);
-                        if (distance >= halfW) continue;
-
-                        const profile = profileDepthFraction(tool, distance / halfW);
-                        const newZ = thickness / 2 - line.lineDepth * profile;
-                        const idx = frontI[k];
-                        const existingZ = vertexDisplacement.has(idx) ? vertexDisplacement.get(idx) : thickness / 2;
-                        if (newZ < existingZ) {
-                            vertexDisplacement.set(idx, newZ);
-                            if (vertexInlayMask) vertexInlayMask.set(idx, !!line.mishima);
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    for (let [vertexIndex, displacement] of vertexDisplacement.entries()) {
-        positions.setZ(vertexIndex, displacement);
-    }
-    positions.needsUpdate = true;
-
-    return vertexDisplacement;
-}
-
-function buildVaseProfile(height, baseRadius, bulge, neck, numPoints) {
-    const points = [];
-    for (let p = 0; p <= numPoints; p++) {
-        const t = p / numPoints;
-        const y = -height / 2 + t * height;
-        const bellyEnvelope = Math.sin(Math.PI * t);
-        const taper = 1 - neck * t;
-        const foot = 0.7 + 0.3 * Math.min(1, t * 5);
-        const r = baseRadius * foot * (1 + bulge * bellyEnvelope * 0.5) * taper;
-        points.push(new THREE.Vector2(Math.max(1, r), y));
-    }
-    return points;
-}
-
-function generateVaseCarvings(pattern, vaseHeight, baseCircumference, minSpacing, maxSpacing, minWidth, maxWidth, styleOpts) {
-    const opts = styleOpts || {};
-    const lines = [];
-
-    if (pattern === 'horizontal' || pattern === 'cross') {
-        let y = -vaseHeight / 2;
-        const maxY = vaseHeight / 2;
-        while (y < maxY) {
-            const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
-            const lineDepth = lineWidth / 3;
-            lines.push(decorateLine({ type: 'ring', y, lineWidth, lineDepth }, opts));
-            y += lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
-        }
-    }
-    if (pattern === 'vertical' || pattern === 'cross') {
-        const stepArc = (minSpacing + maxSpacing) / 2;
-        let theta = 0;
-        const twoPi = 2 * Math.PI;
-        let safety = 0;
-        while (theta < twoPi && safety++ < 500) {
-            const lineWidth = Math.random() * (maxWidth - minWidth) + minWidth;
-            const lineDepth = lineWidth / 3;
-            // For hand-drawn look: stripes sometimes don't span full height
-            let yStart = -vaseHeight / 2;
-            let yEnd = vaseHeight / 2;
-            if (opts.handDrawn && Math.random() < 0.5) {
-                const a = Math.random();
-                const b = Math.random();
-                yStart = -vaseHeight / 2 + Math.min(a, b) * vaseHeight;
-                yEnd = -vaseHeight / 2 + Math.max(a, b) * vaseHeight;
-            }
-            lines.push(decorateLine({ type: 'stripe', theta, yStart, yEnd, lineWidth, lineDepth }, opts));
-            const arcStep = lineWidth + Math.random() * (maxSpacing - minSpacing) + minSpacing;
-            theta += (arcStep / baseCircumference) * twoPi;
-        }
-    }
-
-    return lines;
-}
-
-function applyCarvingsToLathe(geometry, carvings, vaseHeight, useMishima) {
-    const positions = geometry.attributes.position;
-    const N = positions.count;
-    const vertexDepth = new Float32Array(N);
-    const vertexInlay = useMishima ? new Uint8Array(N) : null;
-
-    for (let i = 0; i < N; i++) {
-        const x = positions.getX(i);
-        const y = positions.getY(i);
-        const z = positions.getZ(i);
-        const r = Math.sqrt(x * x + z * z);
-        if (r < 0.01) continue;
-        const theta = Math.atan2(z, x);
-
-        for (let li = 0; li < carvings.length; li++) {
-            const line = carvings[li];
-
-            if (line.type === 'ring') {
-                let centerY = line.y;
-                if (line.organic && line.organicAmp) {
-                    centerY += line.organicAmp * simplex.noise2D(theta * 4, line.seed);
-                }
-                let lineWidth = line.lineWidth;
-                if (line.handDrawn && line.widthVariance) {
-                    lineWidth *= Math.max(0.2, 1 + line.widthVariance * simplex.noise2D(theta * 2.5, line.widthSeed));
-                }
-                const halfW = Math.max(0.4, lineWidth / 2);
-                if (line.handDrawn && line.partialProb) {
-                    const m = (simplex.noise2D(theta * 1.3, line.maskSeed) + 1) * 0.5;
-                    if (m < line.partialProb) continue;
-                }
-                const dist = Math.abs(y - centerY);
-                if (dist >= halfW) continue;
-
-                const profile = profileDepthFraction(line.tool || 'cosine', dist / halfW);
-                const newDepth = line.lineDepth * profile;
-                if (newDepth > vertexDepth[i]) {
-                    vertexDepth[i] = newDepth;
-                    if (vertexInlay) vertexInlay[i] = line.mishima ? 1 : 0;
-                }
-
-            } else if (line.type === 'stripe') {
-                if (y < line.yStart || y > line.yEnd) continue;
-                let centerTheta = line.theta;
-                if (line.organic && line.organicAmp) {
-                    centerTheta += (line.organicAmp / Math.max(1, r)) * simplex.noise2D(y * line.organicFreq, line.seed);
-                }
-                let lineWidth = line.lineWidth;
-                if (line.handDrawn && line.widthVariance) {
-                    lineWidth *= Math.max(0.2, 1 + line.widthVariance * simplex.noise2D(y * 0.04, line.widthSeed));
-                }
-                const halfW = Math.max(0.4, lineWidth / 2);
-                if (line.handDrawn && line.partialProb) {
-                    const m = (simplex.noise2D(y * 0.04, line.maskSeed) + 1) * 0.5;
-                    if (m < line.partialProb) continue;
-                }
-                let angDist = Math.abs(theta - centerTheta);
-                if (angDist > Math.PI) angDist = 2 * Math.PI - angDist;
-                const arcDist = r * angDist;
-                if (arcDist >= halfW) continue;
-
-                const profile = profileDepthFraction(line.tool || 'cosine', arcDist / halfW);
-                const newDepth = line.lineDepth * profile;
-                if (newDepth > vertexDepth[i]) {
-                    vertexDepth[i] = newDepth;
-                    if (vertexInlay) vertexInlay[i] = line.mishima ? 1 : 0;
-                }
-            }
-        }
-    }
-
-    // Push displaced vertices radially inward
-    for (let i = 0; i < N; i++) {
-        const d = vertexDepth[i];
-        if (d === 0) continue;
-        const x = positions.getX(i);
-        const z = positions.getZ(i);
-        const r = Math.sqrt(x * x + z * z);
-        if (r < 0.01) continue;
-        const theta = Math.atan2(z, x);
-        const newR = Math.max(0.5, r - d);
-        positions.setX(i, newR * Math.cos(theta));
-        positions.setZ(i, newR * Math.sin(theta));
-    }
-    positions.needsUpdate = true;
-
-    return { vertexDepth, vertexInlay };
-}
-
-function applyInlayColorsLathe(geometry, vertexDepth, vertexInlay, panelColor, inlayColor, maxDepth) {
-    const positions = geometry.attributes.position;
-    const N = positions.count;
-    const colors = new Float32Array(N * 3);
-    const tmp = new THREE.Color();
-    const safeMax = maxDepth > 0 ? maxDepth : 1;
-    for (let i = 0; i < N; i++) {
-        if (vertexInlay && vertexInlay[i]) {
-            const factor = Math.min(1, vertexDepth[i] / safeMax);
-            tmp.copy(panelColor).lerp(inlayColor, factor);
-            colors[i * 3] = tmp.r;
-            colors[i * 3 + 1] = tmp.g;
-            colors[i * 3 + 2] = tmp.b;
-        } else {
-            colors[i * 3] = panelColor.r;
-            colors[i * 3 + 1] = panelColor.g;
-            colors[i * 3 + 2] = panelColor.b;
-        }
-    }
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-}
-
-function createVase() {
-    clearScene();
-
-    const height = parseFloat(document.getElementById('vaseHeight').value);
-    const baseRadius = parseFloat(document.getElementById('vaseRadius').value);
-    const bulge = parseFloat(document.getElementById('vaseBulge').value);
-    const neck = parseFloat(document.getElementById('vaseNeck').value);
-    const vaseColor = new THREE.Color(document.getElementById('vaseColor').value);
-
-    const profilePoints = buildVaseProfile(height, baseRadius, bulge, neck, 100);
-    const radialSegments = 300;
-    const geometry = new THREE.LatheGeometry(profilePoints, radialSegments);
-
-    const styleOpts = readStyleOpts();
-    const pattern = document.getElementById('pattern').value;
-    const minSpacing = parseFloat(document.getElementById('minSpacing').value);
-    const maxSpacing = parseFloat(document.getElementById('maxSpacing').value);
-    const minWidth = parseFloat(document.getElementById('minWidth').value);
-    const maxWidth = parseFloat(document.getElementById('maxWidth').value);
-
-    const carvings = generateVaseCarvings(
-        pattern, height, 2 * Math.PI * baseRadius,
-        minSpacing, maxSpacing, minWidth, maxWidth, styleOpts
-    );
-
-    const useMishima = styleOpts.mishimaEnabled;
-    const inlayColor = new THREE.Color(document.getElementById('inlayColor').value);
-    const maxLineDepth = carvings.reduce((m, l) => Math.max(m, l.lineDepth), 0) || 1;
-
-    const result = applyCarvingsToLathe(geometry, carvings, height, useMishima);
-    geometry.computeVertexNormals();
-
-    const material = new THREE.MeshPhongMaterial({
-        color: vaseColor,
-        vertexColors: useMishima,
-        side: THREE.DoubleSide,
-        shininess: 60,
-    });
-    if (useMishima) {
-        applyInlayColorsLathe(geometry, result.vertexDepth, result.vertexInlay, vaseColor, inlayColor, maxLineDepth);
-    }
-
-    const vase = new THREE.Mesh(geometry, material);
-    scene.add(vase);
-
-    // Carving length for PDF: rings × circumference, stripes × span
-    carvingLines = [];
-    currentLinesData = carvings;
-    carvings.forEach(line => {
-        if (line.type === 'ring') {
-            // approximate radius at line.y by sampling profile
-            let r = baseRadius;
-            for (let p = 0; p < profilePoints.length - 1; p++) {
-                if (profilePoints[p].y <= line.y && profilePoints[p + 1].y >= line.y) {
-                    r = (profilePoints[p].x + profilePoints[p + 1].x) / 2;
-                    break;
-                }
-            }
-            const halfC = Math.PI * r;
-            carvingLines.push([{ start: { x: -halfC, y: line.y }, end: { x: halfC, y: line.y } }]);
-        } else if (line.type === 'stripe') {
-            carvingLines.push([{ start: { x: line.theta * baseRadius, y: line.yStart }, end: { x: line.theta * baseRadius, y: line.yEnd } }]);
-        }
-    });
-
-    fitPanelToView();
-}
-
-function applyInlayColors(geometry, displacement, inlayMask, panelColor, inlayColor, maxDepth, thickness) {
-    const positions = geometry.attributes.position;
-    const colors = new Float32Array(positions.count * 3);
-    const tmp = new THREE.Color();
-    const safeMax = maxDepth > 0 ? maxDepth : 1;
-
-    for (let i = 0; i < positions.count; i++) {
-        if (inlayMask.get(i)) {
-            const z = displacement.has(i) ? displacement.get(i) : thickness / 2;
-            const depth = Math.max(0, thickness / 2 - z);
-            const factor = Math.min(1, depth / safeMax);
-            tmp.copy(panelColor).lerp(inlayColor, factor);
-            colors[i * 3] = tmp.r;
-            colors[i * 3 + 1] = tmp.g;
-            colors[i * 3 + 2] = tmp.b;
-        } else {
-            colors[i * 3] = panelColor.r;
-            colors[i * 3 + 1] = panelColor.g;
-            colors[i * 3 + 2] = panelColor.b;
-        }
-    }
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-}
-
-function updatePanel() {
-    const modeEl = document.getElementById('formMode');
-    const mode = modeEl ? modeEl.value : 'panel';
-    if (mode === 'vase') {
-        createVase();
+// === Camera fit / mouse / animate ===
+function fitPanelToView() {
+    const panelW = parseFloat(document.getElementById('width').value);
+    const panelH = parseFloat(document.getElementById('height').value);
+    const aspect = window.innerWidth / window.innerHeight;
+    const panelAspect = panelW / panelH;
+    const fovTanHalf = Math.tan((camera.fov * Math.PI / 180) / 2);
+    let fitDistance;
+    if (panelAspect > aspect) {
+        fitDistance = (panelW / aspect) / (2 * fovTanHalf);
     } else {
-        createPanel();
+        fitDistance = panelH / (2 * fovTanHalf);
     }
-    resetView();
-}
-
-function onFormModeChange() {
-    const mode = document.getElementById('formMode').value;
-    const panelStep = document.getElementById('step1-panel');
-    const vaseStep = document.getElementById('step1b-vase');
-    if (panelStep) panelStep.style.display = mode === 'panel' ? '' : 'none';
-    if (vaseStep) vaseStep.style.display = mode === 'vase' ? '' : 'none';
-    updatePanel();
-}
-
-function resetView() {
+    cameraDistance = fitDistance * 1.15;
+    camera.position.set(0, 0, cameraDistance);
+    camera.lookAt(0, 0, 0);
     targetRotationX = 0;
     targetRotationY = 0;
-    fitPanelToView();
+    scene.rotation.x = 0;
+    scene.rotation.y = 0;
 }
 
-function fitPanelToView() {
-    const box = new THREE.Box3().setFromObject(scene);
-    const size = new THREE.Vector3();
-    box.getSize(size);
-    const maxSize = Math.max(size.x, size.y, size.z);
-    const fitHeightDistance = maxSize / (2 * Math.atan(Math.PI * camera.fov / 360));
-    const fitWidthDistance = fitHeightDistance / camera.aspect;
-    const distance = fitHeightDistance > fitWidthDistance ? fitHeightDistance : fitWidthDistance;
-    camera.position.set(0, 0, distance * 1.2);
-    camera.lookAt(box.getCenter(new THREE.Vector3()));
+function resetView() { fitPanelToView(); }
+
+function clearScene() {
+    if (!scene) return;
+    cellMeshes.forEach((m) => {
+        scene.remove(m);
+        if (m.geometry) m.geometry.dispose();
+        if (m.material) m.material.dispose();
+    });
+    cellMeshes = [];
 }
 
-function onMouseDown(event) {
-    isMouseDown = true;
-    mouseX = event.clientX;
-    mouseY = event.clientY;
+function onMouseDown(e) { isMouseDown = true; mouseX = e.clientX; mouseY = e.clientY; }
+function onMouseUp() { isMouseDown = false; }
+function onMouseMove(e) {
+    if (!isMouseDown) return;
+    const dx = e.clientX - mouseX;
+    const dy = e.clientY - mouseY;
+    targetRotationY += dx * 0.005;
+    targetRotationX += dy * 0.005;
+    targetRotationX = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, targetRotationX));
+    mouseX = e.clientX;
+    mouseY = e.clientY;
 }
-
-function onMouseMove(event) {
-    if (isMouseDown) {
-        const deltaX = event.clientX - mouseX;
-        const deltaY = event.clientY - mouseY;
-
-        targetRotationY += deltaX * 0.01;
-        targetRotationX += deltaY * 0.01;
-
-        mouseX = event.clientX;
-        mouseY = event.clientY;
-    }
+function onMouseWheel(e) {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 1.08 : 0.92;
+    cameraDistance = Math.max(100, Math.min(6000, cameraDistance * factor));
+    camera.position.z = cameraDistance;
 }
-
-function onMouseUp() {
-    isMouseDown = false;
-}
-
-function onMouseWheel(event) {
-    event.preventDefault();
-    const next = camera.position.z + event.deltaY;
-    camera.position.z = Math.min(MAX_CAMERA_Z, Math.max(MIN_CAMERA_Z, next));
-}
-
 function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
@@ -779,246 +587,103 @@ function onWindowResize() {
 
 function animate() {
     requestAnimationFrame(animate);
-
-    scene.rotation.x += (targetRotationX - scene.rotation.x) * 0.05;
-    scene.rotation.y += (targetRotationY - scene.rotation.y) * 0.05;
-
+    scene.rotation.x += (targetRotationX - scene.rotation.x) * 0.1;
+    scene.rotation.y += (targetRotationY - scene.rotation.y) * 0.1;
     renderer.render(scene, camera);
 }
 
-class OBJExporter {
-    parse(object) {
-        let output = '';
-        let indexVertex = 0;
-        let indexVertexUvs = 0;
-        let indexNormals = 0;
+function updatePanel() { createPanel(); }
 
-        const vertex = new THREE.Vector3();
-        const normal = new THREE.Vector3();
-        const uv = new THREE.Vector2();
-
-        const parseMesh = (mesh) => {
-            let geometry = mesh.geometry;
-
-            if (geometry instanceof THREE.BufferGeometry) {
-                if (geometry.index !== null) {
-                    geometry = geometry.toNonIndexed();
-                }
-
-                const positions = geometry.attributes.position;
-                const normals = geometry.attributes.normal;
-                const uvs = geometry.attributes.uv;
-
-                if (!positions) {
-                    console.error('OBJExporter: Geometry has no positions.');
-                    return;
-                }
-
-                for (let i = 0, l = positions.count; i < l; i++) {
-                    vertex.fromBufferAttribute(positions, i).applyMatrix4(mesh.matrixWorld);
-                    output += `v ${vertex.x} ${vertex.y} ${vertex.z}\n`;
-                }
-
-                if (normals !== undefined) {
-                    for (let i = 0, l = normals.count; i < l; i++) {
-                        normal.fromBufferAttribute(normals, i);
-                        normal.applyMatrix3(new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld));
-                        output += `vn ${normal.x} ${normal.y} ${normal.z}\n`;
-                    }
-                }
-
-                if (uvs !== undefined) {
-                    for (let i = 0, l = uvs.count; i < l; i++) {
-                        uv.fromBufferAttribute(uvs, i);
-                        output += `vt ${uv.x} ${uv.y}\n`;
-                    }
-                }
-
-                for (let i = 0, j = 1, l = positions.count; i < l; i += 3, j += 3) {
-                    output += 'f ';
-                    output += (indexVertex + i + 1) + '/' + (indexVertexUvs + i + 1) + '/' + (indexNormals + i + 1) + ' ';
-                    output += (indexVertex + i + 2) + '/' + (indexVertexUvs + i + 2) + '/' + (indexNormals + i + 2) + ' ';
-                    output += (indexVertex + i + 3) + '/' + (indexVertexUvs + i + 3) + '/' + (indexNormals + i + 3) + '\n';
-                }
-
-                indexVertex += positions.count;
-                indexVertexUvs += uvs ? uvs.count : 0;
-                indexNormals += normals ? normals.count : 0;
-            } else {
-                console.warn('OBJExporter: Geometry is not an instance of THREE.BufferGeometry.', geometry);
-                return;
-            }
-        };
-
-        object.traverse(function (child) {
-            if (child instanceof THREE.Mesh) {
-                parseMesh(child);
-            }
-        });
-
-        return output;
-    }
-}
-
-function exportModel() {
-    try {
-        const exporter = new OBJExporter();
-        const result = exporter.parse(scene);
-        if (result.length === 0) {
-            console.error("Exported OBJ is empty");
-            alert("Export failed: Generated OBJ is empty");
-            return;
-        }
-        const blob = new Blob([result], { type: 'text/plain' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = 'panel.obj';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-    } catch (error) {
-        console.error("Error in exportModel:", error);
-        alert("Export failed: " + error.message);
-    }
-}
-
-async function previewPDF() {
-    const pdfBlob = await generatePDFBlob();
-    const url = URL.createObjectURL(pdfBlob);
-    window.open(url, '_blank');
-}
-
-async function generatePDFBlob() {
-    const width = parseFloat(document.getElementById('width').value);
-    const height = parseFloat(document.getElementById('height').value);
-    const thickness = parseFloat(document.getElementById('thickness').value);
-
-    const carvingLength = calculateCarvingLength();
-    const area = (width * height) / 1000000;
-
+// === Export PNG ===
+function exportPNG() {
     renderer.render(scene, camera);
-
-    const canvas = await html2canvas(document.getElementById('scene-container'), { backgroundColor: null });
-    const imgData = canvas.toDataURL('image/png');
-
-    const { jsPDF } = window.jspdf;
-    const pdf = new jsPDF();
-
-    pdf.setFontSize(16);
-    pdf.text('3D Panel Report', 10, 10);
-    pdf.setFontSize(12);
-    pdf.text(`Width: ${width} mm`, 10, 20);
-    pdf.text(`Height: ${height} mm`, 10, 30);
-    pdf.text(`Thickness: ${thickness} mm`, 10, 40);
-    pdf.text(`Carving Length: ${carvingLength.toFixed(2)} mm`, 10, 50);
-    pdf.text(`Area: ${area.toFixed(2)} square meters`, 10, 60);
-
-    pdf.addImage(imgData, 'PNG', 10, 70, 180, 120);
-
-    return pdf.output('blob');
-}
-
-async function exportZip() {
-    const zip = new JSZip();
-
-    const exporter = new OBJExporter();
-    const objData = exporter.parse(scene);
-    zip.file('panel.obj', objData);
-
-    const pdfBlob = await generatePDFBlob();
-    zip.file('panel_report.pdf', pdfBlob);
-
-    zip.file('panel.gcode', generateCNCCode());
-
-    zip.generateAsync({ type: 'blob' }).then(function(content) {
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(content);
-        link.download = 'panel_files.zip';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-    });
-}
-
-function generateCNCCode() {
-    const modeEl = document.getElementById('formMode');
-    const mode = modeEl ? modeEl.value : 'panel';
-    if (mode === 'vase') {
-        return '; G-code export is only supported for Panel mode\n; Vases require a 4-axis lathe CNC and aren\'t handled yet\n';
-    }
-
-    const width = parseFloat(document.getElementById('width').value);
-    const height = parseFloat(document.getElementById('height').value);
-    const safeZ = 5;
-    const plungeFeed = 200;
-    const cutFeed = 800;
-
-    const lines = [];
-    lines.push('; G-code generated by 3D Panel Designer');
-    lines.push(`; Panel: ${width} x ${height} mm`);
-    lines.push(`; Carvings: ${currentLinesData.length}`);
-    lines.push('G21 ; mm');
-    lines.push('G90 ; absolute');
-    lines.push('G17 ; XY plane');
-    lines.push('M3 S12000 ; spindle on');
-    lines.push(`G0 Z${safeZ}`);
-
-    currentLinesData.forEach(line => {
-        const samples = sampleLineCenterline(line, width, height);
-        if (samples.length < 2) return;
-        const depth = (-line.lineDepth).toFixed(3);
-        const tool = line.tool || 'cosine';
-        if (line.mishima) lines.push(`; mishima inlay (visual only)`);
-        lines.push(`; tool profile: ${tool}`);
-        // Convert from panel-center coords to bottom-left corner coords
-        const startX = (samples[0].x + width / 2).toFixed(3);
-        const startY = (samples[0].y + height / 2).toFixed(3);
-        lines.push(`G0 X${startX} Y${startY}`);
-        lines.push(`G1 Z${depth} F${plungeFeed}`);
-        for (let s = 1; s < samples.length; s++) {
-            const sx = (samples[s].x + width / 2).toFixed(3);
-            const sy = (samples[s].y + height / 2).toFixed(3);
-            lines.push(`G1 X${sx} Y${sy} F${cutFeed}`);
-        }
-        lines.push(`G0 Z${safeZ}`);
-    });
-
-    lines.push('M5 ; spindle off');
-    lines.push('M30 ; end');
-    return lines.join('\n');
-}
-
-function exportCNC() {
-    const gcode = generateCNCCode();
-    const blob = new Blob([gcode], { type: 'text/plain' });
+    const data = renderer.domElement.toDataURL('image/png');
     const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'panel.gcode';
+    link.href = data;
+    link.download = 'panel.png';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
 }
 
-function calculateCarvingLength() {
-    let carvingLength = 0;
-    carvingLines.forEach(lineSegments => {
-        for (let i = 0; i < lineSegments.length; i++) {
-            const start = lineSegments[i].start;
-            const end = lineSegments[i].end;
-            const segmentLength = Math.sqrt((end.x - start.x) ** 2 + (end.y - start.y) ** 2);
-            carvingLength += segmentLength;
-        }
-    });
-    return carvingLength;
+// === OBJ export (kept from previous) ===
+class OBJExporter {
+    parse(object) {
+        let output = '';
+        let indexVertex = 0, indexVertexUvs = 0, indexNormals = 0;
+        const vertex = new THREE.Vector3();
+        const normal = new THREE.Vector3();
+        const uv = new THREE.Vector2();
+        const parseMesh = (mesh) => {
+            let geometry = mesh.geometry;
+            if (!(geometry instanceof THREE.BufferGeometry)) return;
+            if (geometry.index !== null) geometry = geometry.toNonIndexed();
+            const positions = geometry.attributes.position;
+            const normals = geometry.attributes.normal;
+            const uvs = geometry.attributes.uv;
+            if (!positions) return;
+            for (let i = 0; i < positions.count; i++) {
+                vertex.fromBufferAttribute(positions, i).applyMatrix4(mesh.matrixWorld);
+                output += `v ${vertex.x} ${vertex.y} ${vertex.z}\n`;
+            }
+            if (normals) {
+                const m = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
+                for (let i = 0; i < normals.count; i++) {
+                    normal.fromBufferAttribute(normals, i).applyMatrix3(m);
+                    output += `vn ${normal.x} ${normal.y} ${normal.z}\n`;
+                }
+            }
+            if (uvs) {
+                for (let i = 0; i < uvs.count; i++) {
+                    uv.fromBufferAttribute(uvs, i);
+                    output += `vt ${uv.x} ${uv.y}\n`;
+                }
+            }
+            for (let i = 0; i < positions.count; i += 3) {
+                output += 'f ';
+                output += (indexVertex + i + 1) + '/' + (indexVertexUvs + i + 1) + '/' + (indexNormals + i + 1) + ' ';
+                output += (indexVertex + i + 2) + '/' + (indexVertexUvs + i + 2) + '/' + (indexNormals + i + 2) + ' ';
+                output += (indexVertex + i + 3) + '/' + (indexVertexUvs + i + 3) + '/' + (indexNormals + i + 3) + '\n';
+            }
+            indexVertex += positions.count;
+            indexVertexUvs += uvs ? uvs.count : 0;
+            indexNormals += normals ? normals.count : 0;
+        };
+        object.traverse((child) => { if (child instanceof THREE.Mesh) parseMesh(child); });
+        return output;
+    }
 }
 
-function clearScene() {
-    const children = scene.children.filter(child => child.type === 'Mesh');
-    children.forEach(child => {
-        scene.remove(child);
-        child.geometry.dispose();
-        child.material.dispose();
-    });
+function exportModel() {
+    const exporter = new OBJExporter();
+    const result = exporter.parse(scene);
+    if (!result.length) { alert('Export failed: empty OBJ'); return; }
+    const blob = new Blob([result], { type: 'text/plain' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'panel.obj';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+async function exportZip() {
+    const zip = new JSZip();
+    const exporter = new OBJExporter();
+    zip.file('panel.obj', exporter.parse(scene));
+    renderer.render(scene, camera);
+    const dataUrl = renderer.domElement.toDataURL('image/png');
+    const pngBytes = atob(dataUrl.split(',')[1]);
+    const buf = new Uint8Array(pngBytes.length);
+    for (let i = 0; i < pngBytes.length; i++) buf[i] = pngBytes.charCodeAt(i);
+    zip.file('panel.png', buf);
+    const content = await zip.generateAsync({ type: 'blob' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(content);
+    link.download = 'panel_files.zip';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 }
 
 init();
