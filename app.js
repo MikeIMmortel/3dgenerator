@@ -230,12 +230,14 @@ function pickSeedPoint(placement, W, H, i, total, density, rng) {
 }
 
 // === Depth canvas rendering ===
-// Each stroke is rasterised as ~PROFILE_LAYERS stacked polyline passes, going
+// Each stroke is rasterised as PROFILE_LAYERS stacked polyline passes, going
 // from full-width-darkest to centerline-brightest. lineCap/lineJoin = 'round'
 // keeps the polyline smooth across direction changes — no per-segment seams.
 // 'lighten' composite ensures the deepest value wins both within a stroke
-// (concentric passes) and between overlapping strokes.
-const PROFILE_LAYERS = 22;
+// (concentric passes) and between overlapping strokes. A final small blur
+// smooths the discrete brightness steps so the groove becomes one continuous V.
+const PROFILE_LAYERS = 48;
+const FINAL_BLUR_PX = 0.9;
 
 function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
     const long = Math.max(panelW, panelH);
@@ -286,6 +288,19 @@ function renderDepthCanvas(panelW, panelH, strokes, bit, frame) {
             ctx.lineWidth = Math.max(0.5, widthMm * mmToPx);
             ctx.stroke();
         }
+    }
+
+    // Smooth the discrete brightness steps: blur into a temp canvas, copy back.
+    if (FINAL_BLUR_PX > 0) {
+        const tmp = document.createElement('canvas');
+        tmp.width = cw;
+        tmp.height = ch;
+        const tctx = tmp.getContext('2d');
+        tctx.filter = `blur(${FINAL_BLUR_PX}px)`;
+        tctx.drawImage(depthCanvas, 0, 0);
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.clearRect(0, 0, cw, ch);
+        ctx.drawImage(tmp, 0, 0);
     }
 
     if (frame === 'thick') {
